@@ -5,20 +5,42 @@
     <LangVersion>9</LangVersion>
     <OutputPath>bin</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <VersionPrefix>1.4.0</VersionPrefix>
-    <GameDir Condition="'$(GameDir)' == ''">$(CU_GAME_DIR)</GameDir>
+    <VersionPrefix>1.5.0</VersionPrefix>
+    <!--
+      游戏路径解析顺序 / Game path resolution order:
+      1. -p:GameDir=...
+      2. Steam 注册表探测 / Steam registry lookup:
+         HKCU\Software\Valve\Steam\SteamPath + \steamapps\common\Casualties Unknown（仅当该目录存在 / only if it exists）
+      3. 下方自定义路径 / hardcoded path below（第 2 步失败时降级 / fallback when step 2 fails）
+      注册表读取依赖完整框架 MSBuild（Visual Studio / MSBuild.exe）；dotnet build 跳过第 2 步。
+      / Registry access requires full-framework MSBuild (Visual Studio / MSBuild.exe); dotnet build skips step 2.
+    -->
+    <SteamRoot Condition="'$(SteamRoot)' == '' and '$(MSBuildRuntimeType)' == 'Full'">$([MSBuild]::GetRegistryValue('HKEY_CURRENT_USER\Software\Valve\Steam', 'SteamPath'))</SteamRoot>
+    <GameDir Condition="'$(GameDir)' == '' and '$(SteamRoot)' != '' and Exists('$(SteamRoot)\steamapps\common\Casualties Unknown')">$(SteamRoot)\steamapps\common\Casualties Unknown</GameDir>
+    <!--
+      自定义降级路径 / Hardcoded fallback path:
+      填游戏安装目录，即包含 BepInEx\ 与 CasualtiesUnknown_Data\ 的路径。
+      / Set this to the game install directory, the folder containing BepInEx\ and CasualtiesUnknown_Data\.
+    -->
+    <GameDir Condition="'$(GameDir)' == ''"></GameDir>
   </PropertyGroup>
 
   <Target Name="ValidateGameDir" BeforeTargets="ResolveAssemblyReferences">
-    <Error Condition="'$(GameDir)' == ''" Text="GameDir is not set. Build with -p:GameDir=&quot;D:\path\to\Casualties Unknown Demo&quot; or set the CU_GAME_DIR environment variable." />
     <Error Condition="!Exists('$(GameDir)\BepInEx\core\BepInEx.dll')" Text="BepInEx.dll was not found under GameDir. Check GameDir: $(GameDir)" />
     <Error Condition="!Exists('$(GameDir)\CasualtiesUnknown_Data\Managed\Unity.TextMeshPro.dll')" Text="Unity.TextMeshPro.dll was not found under GameDir. Check GameDir: $(GameDir)" />
   </Target>
-
+	
   <ItemGroup>
-    <!-- Override with: dotnet build -p:GameDir="D:\path\to\Casualties Unknown Demo" -->
     <Reference Include="BepInEx">
       <HintPath>$(GameDir)\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(GameDir)\CasualtiesUnknown_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(GameDir)\BepInEx\core\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
