@@ -15,7 +15,7 @@ using UnityEngine.TextCore.LowLevel;
 
 namespace CuFontLoader
 {
-    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.0")]
+    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.1")]
     [BepInDependency("net.cucorelib", BepInDependency.DependencyFlags.SoftDependency)]
     public class FontLoaderPlugin : BaseUnityPlugin
     {
@@ -1443,7 +1443,7 @@ namespace CuFontLoader
             foreach (OriginalTextState state in OriginalTmpStates.Values)
             {
                 TMP_FontAsset original = ResolveFontAsset(state.FontName, state.Font, OriginalAssetLookup);
-                if (original != null && !originals.Contains(original))
+                if (original != null && !KnownFonts.Contains(original) && !originals.Contains(original))
                 {
                     originals.Add(original);
                 }
@@ -1473,9 +1473,11 @@ namespace CuFontLoader
             }
 
             Material currentMaterial = text.fontSharedMaterial;
+
             // Refresh the baseline when the text does not currently use one of our fonts: the game or
-            // another mod may have re-fonted it since the snapshot was taken.
-            if (!OriginalTmpStates.ContainsKey(text) || !IsKnownFont(currentFont))
+            // another mod may have re-fonted it since the snapshot was taken. Our own asset must never
+            // become a snapshot, otherwise missing glyphs would fall back to a previously applied font.
+            if (!IsKnownFont(currentFont))
             {
                 OriginalTextState original = default(OriginalTextState);
                 original.Font = currentFont;
@@ -1483,11 +1485,25 @@ namespace CuFontLoader
                 original.Material = currentMaterial;
                 OriginalTmpStates[text] = original;
             }
+            else if (!OriginalTmpStates.ContainsKey(text))
+            {
+                // First sighting already on our font (a clone of a replaced prefab): remember the game
+                // default, so a restore has a target instead of keeping our font.
+                TMP_FontAsset gameDefault = TMP_Settings.defaultFontAsset;
+                if (gameDefault != null)
+                {
+                    OriginalTextState fallback = default(OriginalTextState);
+                    fallback.Font = gameDefault;
+                    fallback.FontName = gameDefault.name;
+                    fallback.Material = gameDefault.material;
+                    OriginalTmpStates[text] = fallback;
+                }
+            }
 
             FontReplaceMode mode = GetEffectiveMode();
             bool replaceMaterial =
                 currentMaterial == null ||
-                currentMaterial == currentFont.material ||
+                IsOurMaterial(currentMaterial, currentFont) ||
                 !PreserveCustomMaterials.Value ||
                 mode == FontReplaceMode.Aggressive;
 
@@ -1511,6 +1527,33 @@ namespace CuFontLoader
             }
 
             return changed;
+        }
+
+        /// <summary>
+        /// True when the material belongs to the given font or to any font this plugin created, so a
+        /// text left carrying a previous replacement's material is repaired instead of mixing two fonts.
+        /// </summary>
+        private static bool IsOurMaterial(Material material, TMP_FontAsset currentFont)
+        {
+            if (material == null)
+            {
+                return false;
+            }
+
+            if (currentFont != null && material == currentFont.material)
+            {
+                return true;
+            }
+
+            foreach (TMP_FontAsset known in KnownFonts)
+            {
+                if (known != null && known.material == material)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -1830,6 +1873,12 @@ namespace CuFontLoader
                 }
 
                 TMP_FontAsset original = ResolveFontAsset(state.FontName, state.Font, resolved);
+                if (original != null && KnownFonts.Contains(original))
+                {
+                    // Poisoned snapshot (one of our fonts): revert to the game default instead.
+                    original = TMP_Settings.defaultFontAsset;
+                }
+
                 if (original == null)
                 {
                     unresolved++;
@@ -1966,6 +2015,12 @@ namespace CuFontLoader
             }
 
             TMP_FontAsset original = ResolveFontAsset(state.FontName, state.Font, cache);
+            if (original != null && KnownFonts.Contains(original))
+            {
+                // Poisoned snapshot (one of our fonts): use the game default instead.
+                original = TMP_Settings.defaultFontAsset;
+            }
+
             if (original == null)
             {
                 return;

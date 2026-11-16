@@ -10,7 +10,7 @@
 - **No game asset modification**：不修改游戏资源文件与 AssetBundle，卸载即恢复
 - **Graceful degradation**：CUCoreLib 缺失时面板不注册，功能全部由配置文件驱动
 
-> **v1.5.0** — 新增设置面板、字重选择与中英双语面板文案；重写 fallback：缺字只回退游戏原字体；字体按需加载，并按（文件, 采样字号）缓存图集。
+> **v1.5.1** — 修复换成无中文字形的系统字体时，中文回退到上一个插件字体（及材质混用）的问题。
 
 ## 来源与分支
 
@@ -19,7 +19,7 @@
 | 上游项目 | [FenChen0211/cu-font-loader](https://github.com/FenChen0211/cu-font-loader) |
 | 本仓库（fork） | [RedAsteroid/cu-font-loader](https://github.com/RedAsteroid/cu-font-loader) |
 | 本分支 | `feat/v1.4.0-pre.1-compatibility`（基于上游同名分支） |
-| 本分支版本 | v1.5.0 |
+| 本分支版本 | v1.5.1 |
 | 许可证 | MIT，上游版权归 FenChen0211；详见 [LICENSE](./LICENSE) |
 
 本分支在上游同名分支的基础上继续开发，行为与上游 `main` 不完全一致。反馈请提交到 [Issues](https://github.com/RedAsteroid/cu-font-loader/issues)，附 BepInEx 日志更佳。
