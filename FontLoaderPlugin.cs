@@ -11,11 +11,12 @@ using BepInEx.Logging;
 using TMPro;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.TextCore;
 using UnityEngine.TextCore.LowLevel;
 
 namespace CuFontLoader
 {
-    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.1")]
+    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.2")]
     [BepInDependency("net.cucorelib", BepInDependency.DependencyFlags.SoftDependency)]
     public class FontLoaderPlugin : BaseUnityPlugin
     {
@@ -55,8 +56,19 @@ namespace CuFontLoader
         internal static ConfigEntry<bool> CompatibilityLog;
         internal static ConfigEntry<int> MaxCompatibilityLogs;
         internal static ConfigEntry<int> MaxCachedSamplingSizes;
+        internal static ConfigEntry<bool> PreserveNonCjk;
+        internal static ConfigEntry<bool> AlignNativeMetrics;
 
         private static float s_nextScanTime;
+
+        /// <summary>
+        /// Extra scans scheduled after a scene load: localization and dynamically created UI usually
+        /// land within a few frames of the scene, well before the next regular scan would see them.
+        /// Only used while PreserveNonCjk is active; -1 in the index means "nothing scheduled".
+        /// </summary>
+        private static readonly float[] SettleScanDelays = { 0.05f, 0.15f, 0.35f, 0.7f };
+        private static float s_settleScanStart;
+        private static int s_settleScanIndex = -1;
 
         /// <summary>Monotonic counter used as the LRU stamp of a cached font asset.</summary>
         private static int s_fontUseCounter;
@@ -68,6 +80,13 @@ namespace CuFontLoader
         private static int s_passFailureCount;
         private static string s_passFailureSignature;
         private static float s_nextFailureLogTime;
+
+        /// <summary>
+        /// Whether the glyph guard was active during the previous pass. A false → true edge means the
+        /// option was just switched on (or a mode change made it effective), which requires the glyph
+        /// purge to look at every asset again.
+        /// </summary>
+        private static bool s_glyphGuardWasActive;
 
         /// <summary>Modes exposed in the in-game panel; legacy values are migrated on load.</summary>
         internal static readonly FontReplaceMode[] PanelModes =
@@ -111,6 +130,57 @@ namespace CuFontLoader
         private static readonly Dictionary<string, TMP_FontAsset> OriginalAssetLookup =
             new Dictionary<string, TMP_FontAsset>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// Last content scanned for "does this text contain CJK", keyed by the TMP text with a reference
+        /// to the string that was scanned: an unchanged HUD costs one reference comparison per pass and
+        /// a content change costs one rescan. Nothing is allocated on the hit path.
+        /// </summary>
+        private static readonly Dictionary<TMP_Text, CjkScanState> CjkScanCache =
+            new Dictionary<TMP_Text, CjkScanState>();
+
+        /// <summary>
+        /// Fonts whose vertical metrics were matched to the game font. TMP takes each character's
+        /// ascender/descender from that character's own font, so a mixed line would otherwise be
+        /// stretched by the larger of the two metrics (see EnsureNativeMetrics).
+        /// </summary>
+        private static readonly HashSet<TMP_FontAsset> NativeMetricsAligned = new HashSet<TMP_FontAsset>();
+
+        /// <summary>Original FaceInfo of every adjusted font, restored when the option goes off.</summary>
+        private static readonly Dictionary<TMP_FontAsset, FaceInfo> OriginalFaceInfo =
+            new Dictionary<TMP_FontAsset, FaceInfo>();
+
+        /// <summary>Game font whose metrics are copied; resolved lazily and throttled on failure.</summary>
+        private static TMP_FontAsset s_metricsReference;
+        private static float s_nextMetricsReferenceResolve;
+
+        /// <summary>
+        /// Primary font the CJK glyphs currently on screen were resolved with. Changing it updates the
+        /// fallback chain, but TMP keeps the old character references in textInfo until the text is
+        /// regenerated, so every text that uses the plugin font must be marked dirty.
+        /// </summary>
+        private static TMP_FontAsset s_lastLayoutPrimary;
+
+        /// <summary>
+        /// In PreserveNonCjk mode the digits of a line come from that text's own font, so the only
+        /// meaningful reference is the game font most of the Chinese texts use. Counted during the pass
+        /// (the texts are walked anyway) instead of scanning the scene again.
+        /// </summary>
+        private static readonly Dictionary<TMP_FontAsset, int> PreserveFontUsage =
+            new Dictionary<TMP_FontAsset, int>();
+
+        private static TMP_FontAsset s_preserveMetricsReference;
+
+        /// <summary>
+        /// Game fonts whose fallback chain this plugin extended with the selected font. PreserveNonCjk
+        /// works by priority fallback: a text keeps its own font (so its digits, Latin and material stay
+        /// untouched) and only the CJK glyphs that font cannot draw come from the plugin font.
+        /// </summary>
+        private static readonly HashSet<TMP_FontAsset> HookedFonts = new HashSet<TMP_FontAsset>();
+
+        /// <summary>Hooked fonts that had no fallback table before, so Unhook can restore null.</summary>
+        private static readonly HashSet<TMP_FontAsset> HookedFontsWithoutTable =
+            new HashSet<TMP_FontAsset>();
+
         private static ConfigFile ConfigFile;
 
         /// <summary>
@@ -132,6 +202,12 @@ namespace CuFontLoader
             public TMP_FontAsset Font;
             public string FontName;
             public Material Material;
+        }
+
+        private struct CjkScanState
+        {
+            public string Text;
+            public bool HasCjk;
         }
 
         public enum FontReplaceMode
@@ -159,7 +235,7 @@ namespace CuFontLoader
                 "General",
                 "Enabled",
                 true,
-                "字体替换总开关。关闭后不替换任何文本，并还原本插件已替换的字体与材质；重新打开立即生效。"
+                "字体替换总开关。关闭后不替换任何文本，并还原本插件替换过的字体、材质，以及加入 TMP fallback 链的插件字体；重新打开立即生效。"
             );
 
             ReplaceAllText = Config.Bind(
@@ -173,10 +249,12 @@ namespace CuFontLoader
                 "General",
                 "ReplaceMode",
                 FontReplaceMode.Normal,
-                "FallbackOnly = 只把外部字体加入 TMP fallback，不主动替换游戏字体（最安全）。 " +
+                "FallbackOnly = 只把外部字体追加到 TMP 全局 fallback，不替换游戏字体（最安全）。 " +
                 "Safe = 只替换普通文本，跳过明显使用 Sprite、特殊字体或自定义材质的文本。 " +
                 "Normal = 替换大多数文本，同时保留其他 Mod 的自定义 UI 和材质。 " +
                 "Aggressive = 接近旧版 Persistent 行为，反复强制替换所有文本。 " +
+                "开启 PreserveNonCjk 时 Safe / Normal / Aggressive 行为相同：都不改写文本字体和材质，只把插件字体挂成中文 fallback，" +
+                "排除规则也不参与；它与 FallbackOnly 的区别是插件字体会被插到实际使用字体的链首并优先于其他 fallback。 " +
                 "旧版 ReplaceOnce / Persistent 会在首次启动时自动迁移为 Normal / Aggressive。"
             );
 
@@ -184,7 +262,8 @@ namespace CuFontLoader
                 "General",
                 "ScanIntervalSeconds",
                 1.0f,
-                "Safe / Normal / Aggressive 模式下，扫描新 TMP 文本的间隔秒数。不建议低于 0.25。"
+                "Safe / Normal / Aggressive 模式下定期扫描已加载 TMP 文本的间隔秒数（新出现的文本通常由 OnEnable 钩子立即处理）。" +
+                "不建议低于 0.25。开启 PreserveNonCjk 时该扫描只用于补挂/恢复 fallback。"
             );
 
             PrimaryFont = Config.Bind(
@@ -223,7 +302,8 @@ namespace CuFontLoader
                 "Font",
                 "AtlasSize",
                 4096,
-                "外部 TMP 动态字体图集大小。中文字符较多，较大的图集可以减少回退到游戏原字体的情况。"
+                "外部 TMP 动态字体图集大小。中文字符较多，图集越大能容纳的字形越多；" +
+                "中文字形加入失败时会继续沿 fallback 链寻找，可能出现缺字。"
             );
 
             SamplingPointSize = Config.Bind(
@@ -249,33 +329,59 @@ namespace CuFontLoader
                 "再次切回该字号会重新解析文件。"
             );
 
+            PreserveNonCjk = Config.Bind(
+                "Font",
+                "PreserveNonCjk",
+                false,
+                "保留游戏原生的数字、英文字母与符号。开启后文本继续使用游戏原字体，插件字体只作为该字体的首选 fallback，" +
+                "用来补它画不出来的中文字形；不含中文的文本完全不参与。这是为中文用户保留部分游戏字体美术风格用的：" +
+                "英文用户、或希望所选字体作用于英文文本时请不要开启，否则英文字体不会生效（英文仍由游戏原字体渲染）。" +
+                "旧版 UI.Text 没有逐字 fallback，只有纯中文标签会整段换字体。该模式不改写 TMP 文本字体，开销低于普通替换；" +
+                "仍会按 ScanIntervalSeconds 扫描已加载文本，并在开启时剔除插件字体里已有的非中文字形（图集不变）。" +
+                "游戏内面板切换立即生效；直接编辑 cfg 需重启。" +
+                " English users: leave this off; otherwise the selected Latin font is not applied to English text."
+            );
+
+            AlignNativeMetrics = Config.Bind(
+                "Font",
+                "AlignNativeMetrics",
+                true,
+                "行距对齐（仅 PreserveNonCjk 模式）。开启时把插件字体的垂直度量（行高、ascent/descent、基线等）按比例对齐到参考字体" +
+                "（当前界面里中文文本最常用的那款游戏字体，也就是实际绘制这些文本数字/英文的字体），避免中英混排时行距被撑高、基线错位。" +
+                "只调整插件字体自身的 FaceInfo，不改任何文本的字体或材质；关闭后使用插件字体自身度量。仅 cfg 可改，改后需重启。"
+            );
+
             PreserveCustomMaterials = Config.Bind(
                 "Compatibility",
                 "PreserveCustomMaterials",
                 true,
                 "保护其他 Mod 的自定义材质。开启时，Safe / Normal 模式会整体跳过使用非默认材质（描边、辉光、自定义 Shader 等）的文本。" +
-                "Aggressive 模式始终恢复旧版强制行为；关闭后，Safe / Normal 也会替换这些文本的字体和材质。"
+                "Aggressive 模式始终恢复旧版强制行为；关闭后，Safe / Normal 也会替换这些文本的字体和材质。" +
+                "PreserveNonCjk 模式下本项不参与：该模式不改写任何文本的字体和材质，自定义材质自然保留。仅 cfg 可改，改后需重启。"
             );
 
             ExcludedFontNames = Config.Bind(
                 "Compatibility",
                 "ExcludedFontNames",
                 "",
-                "不替换使用这些字体（FontAsset 名称）的文本。逗号分隔，不区分大小写，名称包含关键字即命中。"
+                "替换模式（PreserveNonCjk 关闭）下，不替换使用这些字体（FontAsset 名称）的文本。逗号分隔，不区分大小写，名称包含关键字即命中。" +
+                "PreserveNonCjk 模式不改写字体，排除项不参与，这些字体的文本仍可能由插件字体补中文。修改后下一次扫描起生效；直接编辑 cfg 需重启。"
             );
 
             ExcludedMaterialNames = Config.Bind(
                 "Compatibility",
                 "ExcludedMaterialNames",
                 "",
-                "不替换使用这些材质（材质名称）的文本。逗号分隔，不区分大小写，名称包含关键字即命中。"
+                "替换模式（PreserveNonCjk 关闭）下，不替换使用这些材质（材质名称）的文本。逗号分隔，不区分大小写，名称包含关键字即命中。" +
+                "PreserveNonCjk 模式保留文本原有材质，排除项不参与，这些文本仍可能由插件字体补中文。修改后下一次扫描起生效；直接编辑 cfg 需重启。"
             );
 
             ExcludedObjectNames = Config.Bind(
                 "Compatibility",
                 "ExcludedObjectNames",
                 "",
-                "不替换这些 GameObject 名称的 TMP / 旧版文本。逗号分隔，不区分大小写，名称包含关键字即命中。"
+                "替换模式（PreserveNonCjk 关闭）下，不替换这些 GameObject 名称的 TMP / 旧版文本。逗号分隔，不区分大小写，名称包含关键字即命中。" +
+                "PreserveNonCjk 模式不做逐文本替换，排除项不参与。修改后下一次扫描起生效；直接编辑 cfg 需重启。"
             );
 
             ExcludedFontNames.SettingChanged += OnExclusionSettingChanged;
@@ -287,7 +393,9 @@ namespace CuFontLoader
                 "Debug",
                 "LogTextDetails",
                 false,
-                "调试用。开启后会在日志中输出 TMP 文本对象名称、激活状态、字体、材质和文本片段。"
+                "调试用。开启后输出 TMP 文本对象名称、激活状态、字体、材质、文本片段，以及 glyphs=…" +
+                "（可见字符中插件字体/原生字体各绘制多少、被插件字体接管的非中文字符样本、实际绘制非中文字符的字体名）；" +
+                "同时启用 [Native] 详细日志（fallback 挂载、字形接管）。"
             );
 
             MaxLoggedTexts = Config.Bind(
@@ -302,7 +410,8 @@ namespace CuFontLoader
                 "CompatibilityLog",
                 false,
                 "兼容性调试日志。开启后，文本被替换或跳过时会输出一行决策记录（场景、对象名、字体、材质、原因）。" +
-                "同一对象的同一决策只记录一次，不会持续刷屏。排查其他 Mod UI 被误伤时开启。"
+                "同一对象的同一决策只记录一次，不会持续刷屏；PreserveNonCjk 模式下没有 TMP 逐文本替换决策，" +
+                "但仍会启用 [Native] 详细日志（字形接管、fallback 挂载）。排查其他 Mod UI 被误伤时开启。"
             );
 
             MaxCompatibilityLogs = Config.Bind(
@@ -314,6 +423,18 @@ namespace CuFontLoader
 
             MigrateLegacyReplaceMode();
             replacementSuspended = !Enabled.Value;
+
+            // The glyph guard keeps non-CJK characters out of the plugin font. It is an optimisation for
+            // PreserveNonCjk, not a requirement: if the TMP entry point cannot be patched, fallback
+            // priority still keeps digits and Latin on the game font.
+            NativeGlyphGuard.Install();
+            TextPipelineHooks.Install();
+            if (PreserveNonCjk.Value)
+            {
+                Log.LogInfo("PreserveNonCjk: text fonts are kept; the plugin font is added as their first " +
+                    "CJK fallback (glyph guard=" + (NativeGlyphGuard.Installed ? "on" : "off") +
+                    ", new text discovery=" + (TextPipelineHooks.DiscoveryInstalled ? "on" : "off") + ").");
+            }
             if (!string.IsNullOrEmpty(PrimaryFont.Value))
             {
                 Log.LogInfo("PrimaryFont is deprecated and ignored ('" + PrimaryFont.Value +
@@ -385,6 +506,9 @@ namespace CuFontLoader
             ApplyToLoadedText(true);
             ApplyToLoadedLegacyText(true);
             FontSettingsPanel.Initialize();
+
+            // The first scene may already be up before plugins load; arm the post-load window here too.
+            ArmSettleScans();
         }
 
         private void Update()
@@ -400,15 +524,22 @@ namespace CuFontLoader
                 return;
             }
 
+            // Newly enabled texts are applied on the frame after they appear; the scheduled scan
+            // below is too slow for that.
+            TextPipelineHooks.Flush();
+
             float interval = Mathf.Max(0.25f, ScanIntervalSeconds.Value);
-            if (Time.unscaledTime < s_nextScanTime)
+            if (Time.unscaledTime >= s_nextScanTime)
             {
+                s_nextScanTime = Time.unscaledTime + interval;
+                ApplyToLoadedText(false);
+                ApplyToLoadedLegacyText(false);
                 return;
             }
 
-            s_nextScanTime = Time.unscaledTime + interval;
-            ApplyToLoadedText(false);
-            ApplyToLoadedLegacyText(false);
+            // Between two scheduled scans: a scene that just loaded gets a few extra passes so UI that
+            // is localized or spawned a few frames later does not keep the game font for a full interval.
+            TryRunSettleScan();
         }
 
         /// <summary>
@@ -423,6 +554,28 @@ namespace CuFontLoader
             }
 
             return Enabled == null || Enabled.Value;
+        }
+
+        /// <summary>
+        /// True when non-CJK characters must stay on the game's font. Inert while replacement is off
+        /// and in FallbackOnly mode: nothing carries our font there, so there is nothing to narrow.
+        /// </summary>
+        internal static bool IsPreserveNonCjkEnabled
+        {
+            get
+            {
+                if (PreserveNonCjk == null || !PreserveNonCjk.Value)
+                {
+                    return false;
+                }
+
+                if (replacementSuspended || (Enabled != null && !Enabled.Value) || ReplaceMode == null)
+                {
+                    return false;
+                }
+
+                return GetEffectiveMode() != FontReplaceMode.FallbackOnly;
+            }
         }
 
         private static FontReplaceMode GetEffectiveMode()
@@ -614,6 +767,93 @@ namespace CuFontLoader
             return false;
         }
 
+        /// <summary>
+        /// True when a TMP text contains at least one CJK character. The scan is cached against the
+        /// exact string instance, which is what keeps a pass cheap on texts that never change.
+        /// </summary>
+        private static bool TextHasCjk(TMP_Text text)
+        {
+            string content = text.text;
+
+            CjkScanState cached;
+            if (CjkScanCache.TryGetValue(text, out cached) && ReferenceEquals(cached.Text, content))
+            {
+                return cached.HasCjk;
+            }
+
+            cached.Text = content;
+            cached.HasCjk = CjkText.ContainsCjk(content);
+            CjkScanCache[text] = cached;
+            return cached.HasCjk;
+        }
+
+        /// <summary>
+        /// Applies the usual replacement decision to a single text, mirroring what the scan pass does
+        /// for it. Used by the enable-event queue; only the text is touched, while counters, statistics
+        /// and the fallback chain stay with the pass.
+        /// </summary>
+        internal static bool ApplySingleText(TMP_Text text)
+        {
+            if (text == null)
+            {
+                return false;
+            }
+
+            if (IsPreserveNonCjkEnabled)
+            {
+                // Priority fallback mode: nothing to replace, only the text's font may need the plugin
+                // font as its CJK fallback. A text still carrying our font (leftover from another mode
+                // or a prefab clone) is put back on a game font first.
+                if (IsKnownFont(text.font))
+                {
+                    RestoreTextFontIfOurs(text, null);
+                }
+
+                if (!IsKnownFont(text.font) && TextHasCjk(text))
+                {
+                    HookFontFallback(text.font);
+                }
+
+                return false;
+            }
+
+            if (SeenTexts.Contains(text))
+            {
+                return false;
+            }
+
+            TextDecision decision = EvaluateTMPText(text);
+            if (!decision.Replace)
+            {
+                if (decision.SkipReason != null)
+                {
+                    LogSkipped(text, decision.SkipReason);
+                    RestoreTextFontIfOurs(text, null);
+                }
+
+                return false;
+            }
+
+            TMP_FontAsset previousFont = text.font;
+            Material previousMaterial = text.fontSharedMaterial;
+            if (!ReplaceTextFont(text))
+            {
+                return false;
+            }
+
+            SeenTexts.Add(text);
+            if (previousFont == text.font && previousMaterial != text.fontSharedMaterial)
+            {
+                LogMaterialFixed(text, previousMaterial);
+            }
+            else
+            {
+                LogReplaced(text, previousFont);
+            }
+
+            return true;
+        }
+
         private static bool TryBeginDecisionLog(UnityEngine.Object key, string signature)
         {
             if (!CompatibilityLog.Value || decisionLogCapReached)
@@ -780,6 +1020,28 @@ namespace CuFontLoader
                 }
             }
 
+            List<TMP_Text> deadScans = null;
+            foreach (KeyValuePair<TMP_Text, CjkScanState> pair in CjkScanCache)
+            {
+                if (pair.Key == null)
+                {
+                    if (deadScans == null)
+                    {
+                        deadScans = new List<TMP_Text>();
+                    }
+
+                    deadScans.Add(pair.Key);
+                }
+            }
+
+            if (deadScans != null)
+            {
+                for (int i = 0; i < deadScans.Count; i++)
+                {
+                    CjkScanCache.Remove(deadScans[i]);
+                }
+            }
+
             List<TMP_Text> deadTexts = null;
             foreach (KeyValuePair<TMP_Text, OriginalTextState> pair in OriginalTmpStates)
             {
@@ -883,6 +1145,24 @@ namespace CuFontLoader
                 LoadedFontStamps.Add(++s_fontUseCounter);
                 KnownFonts.Add(fontAsset);
                 KnownUnityFonts.Add(dynamicFont);
+
+                if (NativeGlyphGuard.IsActive)
+                {
+                    int stripped = NativeGlyphGuard.EnsurePure(fontAsset);
+                    if (stripped > 0)
+                    {
+                        Log.LogInfo("  CJK-only glyph set: " + stripped +
+                            " synthesized non-CJK character(s) removed.");
+                    }
+                }
+
+                if (IsPreserveNonCjkEnabled && AlignNativeMetrics.Value)
+                {
+                    // Match the game's vertical proportions before any text uses this asset, so mixed
+                    // lines do not re-layout later with a different line spacing.
+                    EnsureNativeMetricsForAll();
+                }
+
                 Log.LogInfo("  OK: " + fontAsset.name + " (" + atlasSize + "x" + atlasSize +
                     " dynamic atlas, sampling " + samplingPointSize + ", " + ElapsedMs(startedAt) + " ms)");
                 if (IsVariableFont(fontPath))
@@ -912,6 +1192,61 @@ namespace CuFontLoader
             ResetSeenState();
             ApplyToLoadedText(true);
             ApplyToLoadedLegacyText(true);
+            ArmSettleScans();
+        }
+
+        /// <summary>
+        /// Schedules the post-load scans. They exist because a scene's UI is often localized or
+        /// instantiated a few frames after sceneLoaded, i.e. after the pass above already ran: the
+        /// texts would otherwise stay on the game font until the next regular scan.
+        /// </summary>
+        private static void ArmSettleScans()
+        {
+            if (!IsPreserveNonCjkEnabled || TextPipelineHooks.DiscoveryInstalled)
+            {
+                // The enable hook already catches new texts; the settle window is only the fallback
+                // for a TMP build where that hook could not be installed.
+                s_settleScanIndex = -1;
+                return;
+            }
+
+            s_settleScanStart = Time.unscaledTime;
+            s_settleScanIndex = 0;
+        }
+
+        /// <summary>
+        /// Runs at most one scheduled pass per frame while the post-load window is open. A frame long
+        /// enough to miss several delays just runs the remaining passes on the following frames.
+        /// </summary>
+        private static void TryRunSettleScan()
+        {
+            if (s_settleScanIndex < 0 || s_settleScanIndex >= SettleScanDelays.Length)
+            {
+                return;
+            }
+
+            if (!IsPreserveNonCjkEnabled)
+            {
+                s_settleScanIndex = -1;
+                return;
+            }
+
+            if (Time.unscaledTime > s_settleScanStart + SettleScanDelays[SettleScanDelays.Length - 1] + 1f)
+            {
+                // The window expired while scans were suspended (disabled, FallbackOnly): drop it
+                // instead of firing the remaining passes late.
+                s_settleScanIndex = -1;
+                return;
+            }
+
+            if (Time.unscaledTime < s_settleScanStart + SettleScanDelays[s_settleScanIndex])
+            {
+                return;
+            }
+
+            s_settleScanIndex++;
+            ApplyToLoadedText(false);
+            ApplyToLoadedLegacyText(false);
         }
 
         private static void ApplyToLoadedText(bool logResult)
@@ -939,7 +1274,84 @@ namespace CuFontLoader
                 LogPassFailure("fallback chain", ex);
             }
 
+            // Fetched before the purge blocks so they can regenerate every text that carries our font,
+            // including ones that are not tracked in SeenTexts (see MarkSeenTextsDirty).
             TMP_Text[] allTexts = Resources.FindObjectsOfTypeAll<TMP_Text>();
+
+            // Glyphs added while the option was off keep being served from the lookup table even with
+            // the guard on, so outstanding ones are stripped before the pass re-resolves the texts.
+            // The purge only looks at assets it has not seen yet, so a false → true edge (option just
+            // switched on, or a mode change made it effective) clears that memory first.
+            bool guardActive = NativeGlyphGuard.IsActive;
+            if (guardActive)
+            {
+                if (!s_glyphGuardWasActive)
+                {
+                    NativeGlyphGuard.InvalidatePurity();
+                }
+
+                try
+                {
+                    PurgeNonCjkGlyphs();
+
+                    // Hand back anything the native fonts can render now; a glyph the game really lacks
+                    // stays in the plugin font so the text does not turn into boxes.
+                    int recovered = NativeGlyphGuard.PurgeRecoverable();
+                    if (recovered > 0)
+                    {
+                        string message = "[Native] returned " + recovered +
+                            " glyph(s) the game fonts can render again.";
+                        if ((LogTextDetails != null && LogTextDetails.Value) ||
+                            (CompatibilityLog != null && CompatibilityLog.Value))
+                        {
+                            Log.LogInfo(message);
+                        }
+                        else
+                        {
+                            Log.LogDebug(message);
+                        }
+                    }
+
+                    // Only glyphs the game fonts can now render need a re-layout: PurgeAll also drops
+                    // characters no native font has (they are re-added on demand and existing textInfo
+                    // entries keep rendering), so marking texts dirty for it would re-layout every pass
+                    // while the fallback chain churns.
+                    if (recovered > 0)
+                    {
+                        // Texts laid out before the purge still reference the plugin font's glyphs;
+                        // regenerate them so the characters actually switch back to the game font.
+                        MarkSeenTextsDirty(allTexts);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogPassFailure("glyph purge", ex);
+                }
+            }
+
+            // Line metrics are not tied to the glyph guard: fallback-drawn CJK glyphs benefit from
+            // matching the game font's vertical proportions even without the guard.
+            if (IsPreserveNonCjkEnabled && AlignNativeMetrics.Value)
+            {
+                try
+                {
+                    // Late reference resolution, a font built before the option was on, or a different
+                    // font taking over the non-CJK glyphs all need their metrics matched here.
+                    int aligned = EnsureNativeMetricsForAll();
+                    if (aligned > 0)
+                    {
+                        // Texts laid out earlier still hold the old metrics; force them to re-generate.
+                        MarkSeenTextsDirty(allTexts);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogPassFailure("font metrics", ex);
+                }
+            }
+
+            s_glyphGuardWasActive = guardActive;
+
             int replaced = 0;
             int skipped = 0;
             int menuTexts = 0;
@@ -961,6 +1373,11 @@ namespace CuFontLoader
                 PruneDestroyed();
             }
 
+            if (IsPreserveNonCjkEnabled)
+            {
+                PreserveFontUsage.Clear();
+            }
+
             try
             {
                 foreach (TMP_Text text in allTexts)
@@ -968,6 +1385,14 @@ namespace CuFontLoader
                     if (text == null)
                     {
                         continue;
+                    }
+
+                    // Texts that already carry our font (e.g. instances of a prefab replaced in an
+                    // earlier pass) have no snapshot; record the game default so a later skip, mode
+                    // change or disable can actually put them back on a game font.
+                    if (IsKnownFont(text.font))
+                    {
+                        RememberDefaultSnapshot(text);
                     }
 
                     if (collectMenuStats && IsInSettingsMenu(text.transform))
@@ -984,6 +1409,29 @@ namespace CuFontLoader
                         // FallbackOnly never replaces: a text still carrying our font (from an earlier
                         // mode) goes back to the game font, the font itself stays registered as fallback.
                         RestoreTextFontIfOurs(text, restoreCache);
+                        continue;
+                    }
+
+                    if (IsPreserveNonCjkEnabled)
+                    {
+                        // Priority fallback mode. The text keeps its own font, so every character the
+                        // game font can draw - digits, Latin, symbols, its own material, its own line
+                        // metrics - stays exactly as shipped. Only the CJK glyphs it cannot draw come
+                        // from the plugin font, which is inserted as the first fallback of that font.
+                        RestoreTextFontIfOurs(text, restoreCache);
+                        if (!IsKnownFont(text.font) && TextHasCjk(text))
+                        {
+                            HookFontFallback(text.font);
+
+                            // A text without a font cannot be counted: Dictionary keys must not be null.
+                            if (text.font != null)
+                            {
+                                int usage;
+                                PreserveFontUsage.TryGetValue(text.font, out usage);
+                                PreserveFontUsage[text.font] = usage + 1;
+                            }
+                        }
+
                         continue;
                     }
 
@@ -1031,6 +1479,22 @@ namespace CuFontLoader
             catch (Exception ex)
             {
                 LogPassFailure("text replacement", ex);
+            }
+
+            if (IsPreserveNonCjkEnabled)
+            {
+                UpdatePreserveMetricsReference();
+
+                // A new primary (local, system or weight) only changes the fallback chain; the glyphs
+                // already resolved in textInfo still point at the previous asset. Regenerate them.
+                if (PrimaryFontAsset != s_lastLayoutPrimary)
+                {
+                    s_lastLayoutPrimary = PrimaryFontAsset;
+                    MarkSeenTextsDirty(allTexts);
+                    Log.LogInfo("[Native] plugin font changed to '" +
+                        (PrimaryFontAsset != null ? PrimaryFontAsset.name : "<none>") +
+                        "'; regenerating texts.");
+                }
             }
 
             if (LogTextDetails.Value)
@@ -1190,6 +1654,7 @@ namespace CuFontLoader
                     ", type=" + text.GetType().Name +
                     ", font=" + fontName +
                     ", material=" + materialName +
+                    ", glyphs=" + DescribeGlyphFonts(text) +
                     ", text=\"" + sample + "\"");
 
                 logged++;
@@ -1210,6 +1675,29 @@ namespace CuFontLoader
             TMP_FontAsset primary = GetPrimaryFontAsset();
             if (primary == null)
             {
+                return 0;
+            }
+
+            if (IsPreserveNonCjkEnabled)
+            {
+                // Priority fallback mode: input fields keep their own font and only the CJK glyphs they
+                // lack come from the plugin font, so the font must be in their font's fallback chain.
+                TMP_InputField[] fields = Resources.FindObjectsOfTypeAll<TMP_InputField>();
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    TMP_InputField field = fields[i];
+                    if (field == null)
+                    {
+                        continue;
+                    }
+
+                    RestoreInputFontIfOurs(field);
+                    if (field.textComponent != null)
+                    {
+                        HookFontFallback(field.textComponent.font);
+                    }
+                }
+
                 return 0;
             }
 
@@ -1328,6 +1816,16 @@ namespace CuFontLoader
                     continue;
                 }
 
+                // Legacy UI.Text has no per-glyph fallback: replacing the font would re-draw digits and
+                // Latin with the plugin font too. Only labels that are pure CJK (nothing but Chinese,
+                // whitespace and CJK punctuation) can be re-fonted without breaking the native look.
+                if (IsPreserveNonCjkEnabled && !CjkText.IsPureCjk(text.text))
+                {
+                    LogLegacySkipped(text, "NativeNonCjk");
+                    RestoreLegacyFontIfOurs(text);
+                    continue;
+                }
+
                 bool firstSeen = !SeenLegacyTexts.Contains(text);
                 if (!enforceRepeatedly && !firstSeen)
                 {
@@ -1365,55 +1863,99 @@ namespace CuFontLoader
             List<TMP_FontAsset> globalFallbacks = TMP_Settings.fallbackFontAssets;
             if (globalFallbacks != null)
             {
+                TMP_FontAsset primary = PrimaryFontAsset;
+                bool front = IsPreserveNonCjkEnabled && GetEffectiveMode() != FontReplaceMode.FallbackOnly;
+
+                // Drop plugin fonts that should not be in the global list, but leave the primary alone
+                // when it already sits in its target slot: removing and re-adding it every pass would
+                // report a change, invalidate the glyph-purity state and force a full purge each scan.
                 for (int i = globalFallbacks.Count - 1; i >= 0; i--)
                 {
-                    if (KnownFonts.Contains(globalFallbacks[i]))
-                    {
-                        globalFallbacks.RemoveAt(i);
-                        changed++;
-                    }
-                }
-
-                if (PrimaryFontAsset != null && !globalFallbacks.Contains(PrimaryFontAsset))
-                {
-                    globalFallbacks.Add(PrimaryFontAsset);
-                    changed++;
-                }
-            }
-
-            List<TMP_FontAsset> originals = CollectOriginalFonts();
-            foreach (TMP_FontAsset font in KnownFonts)
-            {
-                if (font == null)
-                {
-                    continue;
-                }
-
-                List<TMP_FontAsset> table = font.fallbackFontAssetTable;
-                if (table == null)
-                {
-                    if (originals.Count == 0)
+                    TMP_FontAsset entry = globalFallbacks[i];
+                    if (!KnownFonts.Contains(entry))
                     {
                         continue;
                     }
 
-                    table = new List<TMP_FontAsset>();
-                    font.fallbackFontAssetTable = table;
-                }
-                else if (SameFallbackChain(table, originals))
-                {
-                    continue;
+                    bool inPlace = entry == primary &&
+                        ((front && i == 0) || (!front && i == globalFallbacks.Count - 1));
+                    if (inPlace)
+                    {
+                        continue;
+                    }
+
+                    globalFallbacks.RemoveAt(i);
+                    changed++;
                 }
 
-                // Drop every plugin font and stale copies of the originals, then append in a fixed order.
-                int before = table.Count;
-                table.RemoveAll(entry => entry == null || KnownFonts.Contains(entry) || originals.Contains(entry));
-                table.AddRange(originals);
-                if (table.Count != before)
+                // In PreserveNonCjk mode Chinese is served by priority fallback, so the font must be in
+                // front of the translation/fallback fonts that are already there. Other modes append it
+                // (FallbackOnly is exactly "register globally, change nothing").
+                if (primary != null)
                 {
+                    if (front)
+                    {
+                        if (globalFallbacks.Count == 0 || globalFallbacks[0] != primary)
+                        {
+                            globalFallbacks.Remove(primary);
+                            globalFallbacks.Insert(0, primary);
+                            changed++;
+                        }
+                    }
+                    else if (globalFallbacks.Count == 0 || globalFallbacks[globalFallbacks.Count - 1] != primary)
+                    {
+                        globalFallbacks.Remove(primary);
+                        globalFallbacks.Add(primary);
+                        changed++;
+                    }
+                }
+            }
+
+            List<TMP_FontAsset> originals = CollectOriginalFonts();
+
+            // An empty list means no snapshot could be resolved right now (e.g. the previous scene's
+            // fonts were unloaded but the new ones are not snapshotted yet). Keep the previous chain:
+            // clearing it would leave the plugin font with no native fallback for a whole pass, and
+            // every non-CJK glyph rendered in that window would stick to the plugin font.
+            if (originals.Count > 0)
+            {
+                foreach (TMP_FontAsset font in KnownFonts)
+                {
+                    if (font == null)
+                    {
+                        continue;
+                    }
+
+                    List<TMP_FontAsset> table = font.fallbackFontAssetTable;
+                    if (table == null)
+                    {
+                        table = new List<TMP_FontAsset>();
+                        font.fallbackFontAssetTable = table;
+                    }
+                    else if (SameFallbackChain(table, originals))
+                    {
+                        continue;
+                    }
+
+                    // Drop every plugin font and stale copies of the originals, then append in a fixed
+                    // order. SameFallbackChain already proved the table differs, so this is a change even
+                    // when the entry count happens to stay the same (a pure reorder).
+                    table.RemoveAll(entry => entry == null || KnownFonts.Contains(entry) || originals.Contains(entry));
+                    table.AddRange(originals);
                     changed++;
                 }
             }
+
+            // A changed chain means a character may now be reachable from a game font where it was
+            // not before: let the guard hand such glyphs back on the purge that follows this call.
+            if (changed > 0 && NativeGlyphGuard.IsActive)
+            {
+                NativeGlyphGuard.InvalidatePurity();
+            }
+
+            // TMP searches each fallback font's own chain recursively; flatten everything reachable so
+            // the glyph guard knows the whole native coverage before it takes a character for itself.
+            NativeGlyphGuard.RefreshNativeProviders(originals);
 
             return changed;
         }
@@ -1436,21 +1978,220 @@ namespace CuFontLoader
             return true;
         }
 
-        /// <summary>The game's own font assets, taken from the snapshots and sorted for a stable chain.</summary>
+        /// <summary>
+        /// Puts the selected font at the front of a game font's fallback chain. In PreserveNonCjk mode
+        /// this is how Chinese is replaced without touching the text: TMP keeps drawing digits, Latin
+        /// and symbols with the game font and only asks the fallback for the CJK characters it lacks.
+        /// </summary>
+        private static void HookFontFallback(TMP_FontAsset font)
+        {
+            TMP_FontAsset primary = PrimaryFontAsset;
+            if (font == null || primary == null || IsKnownFont(font))
+            {
+                return;
+            }
+
+            List<TMP_FontAsset> table = font.fallbackFontAssetTable;
+            if (table == null)
+            {
+                table = new List<TMP_FontAsset>();
+                font.fallbackFontAssetTable = table;
+                HookedFontsWithoutTable.Add(font);
+            }
+
+            if (table.Count > 0 && table[0] == primary)
+            {
+                HookedFonts.Add(font);
+                return;
+            }
+
+            // Our fonts never stack on each other; the other fallbacks keep their order after them.
+            table.RemoveAll(entry => entry == null || IsKnownFont(entry));
+            table.Insert(0, primary);
+            if (HookedFonts.Add(font) && (LogTextDetails.Value || CompatibilityLog.Value))
+            {
+                Log.LogInfo("[Native] '" + primary.name + "' is now the first fallback of '" + font.name + "'.");
+            }
+        }
+
+        /// <summary>Removes the plugin font from every fallback chain this plugin extended.</summary>
+        private static void UnhookFontFallbacks()
+        {
+            if (HookedFonts.Count == 0)
+            {
+                HookedFontsWithoutTable.Clear();
+                return;
+            }
+
+            foreach (TMP_FontAsset font in HookedFonts)
+            {
+                if (font == null)
+                {
+                    continue;
+                }
+
+                List<TMP_FontAsset> table = font.fallbackFontAssetTable;
+                if (table == null)
+                {
+                    continue;
+                }
+
+                table.RemoveAll(entry => entry == null || IsKnownFont(entry));
+                if (table.Count == 0 && HookedFontsWithoutTable.Contains(font))
+                {
+                    font.fallbackFontAssetTable = null;
+                }
+            }
+
+            HookedFonts.Clear();
+            HookedFontsWithoutTable.Clear();
+        }
+
+        /// <summary>Reverts every legacy label this plugin re-fonted, see ApplyToLoadedLegacyText.</summary>
+        /// <summary>
+        /// The game's own font assets, taken from the snapshots. The order is stable so the font that
+        /// serves non-CJK glyphs (and that the plugin font's metrics are aligned to) does not drift as
+        /// more texts are seen: the game default comes first when it is in use, the rest follow by name.
+        /// A still-empty chain is seeded with the game default so the first pass already has a native
+        /// target to fall back to.
+        /// </summary>
         private static List<TMP_FontAsset> CollectOriginalFonts()
         {
             List<TMP_FontAsset> originals = new List<TMP_FontAsset>();
             foreach (OriginalTextState state in OriginalTmpStates.Values)
             {
                 TMP_FontAsset original = ResolveFontAsset(state.FontName, state.Font, OriginalAssetLookup);
-                if (original != null && !KnownFonts.Contains(original) && !originals.Contains(original))
+                if (original == null || KnownFonts.Contains(original) || originals.Contains(original))
                 {
-                    originals.Add(original);
+                    continue;
+                }
+
+                originals.Add(original);
+            }
+
+            TMP_FontAsset gameDefault = null;
+            if (IsPreserveNonCjkEnabled)
+            {
+                try
+                {
+                    gameDefault = TMP_Settings.defaultFontAsset;
+                }
+                catch (Exception)
+                {
+                    gameDefault = null;
+                }
+
+                if (gameDefault != null && KnownFonts.Contains(gameDefault))
+                {
+                    gameDefault = null;
                 }
             }
 
-            originals.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
+            if (originals.Count == 0 && gameDefault != null)
+            {
+                originals.Add(gameDefault);
+            }
+
+            if (gameDefault != null)
+            {
+                originals.Sort((a, b) =>
+                {
+                    if (a == gameDefault)
+                    {
+                        return -1;
+                    }
+
+                    if (b == gameDefault)
+                    {
+                        return 1;
+                    }
+
+                    return string.CompareOrdinal(a.name, b.name);
+                });
+            }
+            else
+            {
+                originals.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
+            }
+
             return originals;
+        }
+
+        /// <summary>
+        /// Records the game default as the snapshot of a text that already carries our font but has no
+        /// snapshot of its own (an instance of a prefab that was replaced in an earlier pass). Without
+        /// it a skip, a mode change or disabling the plugin could not put the text back on a game font.
+        /// </summary>
+        private static void RememberDefaultSnapshot(TMP_Text text)
+        {
+            if (text == null || OriginalTmpStates.ContainsKey(text))
+            {
+                return;
+            }
+
+            TMP_FontAsset gameDefault = TMP_Settings.defaultFontAsset;
+            if (gameDefault == null || IsKnownFont(gameDefault))
+            {
+                return;
+            }
+
+            OriginalTextState state = default(OriginalTextState);
+            state.Font = gameDefault;
+            state.FontName = gameDefault.name;
+            state.Material = gameDefault.material;
+            OriginalTmpStates[text] = state;
+        }
+
+        /// <summary>
+        /// True/false summary of which font asset actually renders the visible characters. Used by the
+        /// text-details diagnostics to tell "the plugin font owns this digit" apart from "the digit is
+        /// simply rendered by a fallback font".
+        /// </summary>
+        private static string DescribeGlyphFonts(TMP_Text text)
+        {
+            TMP_TextInfo info = text.textInfo;
+            if (info == null || info.characterInfo == null || info.characterCount <= 0)
+            {
+                return "n/a";
+            }
+
+            int ours = 0;
+            int native = 0;
+            string taken = string.Empty;
+            string nonCjkFonts = string.Empty;
+            int limit = Mathf.Min(info.characterCount, info.characterInfo.Length);
+            for (int i = 0; i < limit; i++)
+            {
+                TMP_CharacterInfo characterInfo = info.characterInfo[i];
+                if (!characterInfo.isVisible)
+                {
+                    continue;
+                }
+
+                TMP_TextElement element = characterInfo.textElement;
+                TMP_FontAsset font = element != null ? element.textAsset as TMP_FontAsset : null;
+                if (IsKnownFont(font))
+                {
+                    ours++;
+                    if (!CjkText.IsCjk(characterInfo.character) && taken.Length < 8)
+                    {
+                        taken += characterInfo.character;
+                    }
+                }
+                else
+                {
+                    native++;
+                    if (!CjkText.IsCjk(characterInfo.character) && font != null &&
+                        nonCjkFonts.IndexOf(font.name, StringComparison.Ordinal) < 0)
+                    {
+                        nonCjkFonts = nonCjkFonts.Length == 0 ? font.name : nonCjkFonts + "," + font.name;
+                    }
+                }
+            }
+
+            return "ours=" + ours + ",native=" + native +
+                (taken.Length > 0 ? ",nonCjkOnOurs=\"" + taken + "\"" : string.Empty) +
+                (nonCjkFonts.Length > 0 ? ",nonCjkFonts=\"" + nonCjkFonts + "\"" : string.Empty);
         }
 
         private static bool ReplaceTextFont(TMP_Text text)
@@ -1734,9 +2475,18 @@ namespace CuFontLoader
         }
 
         /// <summary>True when the asset was created by this plugin, including pre-rebuild assets.</summary>
-        private static bool IsKnownFont(TMP_FontAsset font)
+        internal static bool IsKnownFont(TMP_FontAsset font)
         {
             return font != null && KnownFonts.Contains(font);
+        }
+
+        /// <summary>
+        /// The plugin's font assets, for the glyph guard. Iterate only: the guard never adds or
+        /// removes entries while walking it.
+        /// </summary>
+        internal static IEnumerable<TMP_FontAsset> KnownFontAssets
+        {
+            get { return KnownFonts; }
         }
 
         /// <summary>
@@ -1839,10 +2589,7 @@ namespace CuFontLoader
         /// </summary>
         private static void RestoreOriginalFonts()
         {
-            if (OriginalTmpStates.Count == 0 && OriginalLegacyFonts.Count == 0 && OriginalInputFonts.Count == 0)
-            {
-                return;
-            }
+            UnhookFontFallbacks();
 
             int restored = 0;
             int unresolved = 0;
@@ -1923,6 +2670,39 @@ namespace CuFontLoader
                 }
             }
 
+            // Labels that were already carrying our font when they were first seen (a clone of a prefab
+            // that was re-fonted earlier) have no snapshot. Put them back on the game font most of the
+            // other legacy labels use, or on Unity's built-in font as a last resort.
+            int legacySwept = 0;
+            int legacyUnresolved = 0;
+            Font legacyFallback = ResolveLegacyFallbackFont();
+            UnityEngine.UI.Text[] legacyTexts = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Text>();
+            for (int i = 0; i < legacyTexts.Length; i++)
+            {
+                UnityEngine.UI.Text text = legacyTexts[i];
+                if (text == null || !KnownUnityFonts.Contains(text.font) ||
+                    OriginalLegacyFonts.ContainsKey(text))
+                {
+                    continue;
+                }
+
+                if (legacyFallback == null)
+                {
+                    legacyUnresolved++;
+                    continue;
+                }
+
+                text.font = legacyFallback;
+                text.SetAllDirty();
+                legacySwept++;
+            }
+
+            if (legacyUnresolved > 0)
+            {
+                Log.LogWarning("Could not restore " + legacyUnresolved +
+                    " legacy label(s): no game font is available as a fallback, they keep the plugin font.");
+            }
+
             // Input fields are found by scanning, not by the snapshot keys: a field that was already
             // carrying one of our fonts when it was first seen has no snapshot of its own.
             int inputRestored = 0;
@@ -1953,11 +2733,114 @@ namespace CuFontLoader
                 }
             }
 
+            // Instances of a prefab that was replaced earlier carry our font without a snapshot entry.
+            // Put them back on the game default so disabling really removes every trace of the plugin.
+            int swept = 0;
+            TMP_FontAsset gameDefault = TMP_Settings.defaultFontAsset;
+            if (gameDefault != null && !IsKnownFont(gameDefault))
+            {
+                TMP_Text[] loadedTexts = Resources.FindObjectsOfTypeAll<TMP_Text>();
+                for (int i = 0; i < loadedTexts.Length; i++)
+                {
+                    TMP_Text text = loadedTexts[i];
+                    if (text == null || !IsKnownFont(text.font) || OriginalTmpStates.ContainsKey(text))
+                    {
+                        continue;
+                    }
+
+                    text.font = gameDefault;
+                    if (gameDefault.material != null)
+                    {
+                        text.fontSharedMaterial = gameDefault.material;
+                    }
+
+                    text.SetAllDirty();
+                    swept++;
+                }
+            }
+
+            // With no primary left, the CJK glyphs already resolved in textInfo would otherwise keep
+            // the old plugin font until their content changes.
+            s_lastLayoutPrimary = null;
+            MarkSeenTextsDirty(Resources.FindObjectsOfTypeAll<TMP_Text>());
+
             Log.LogInfo("Original fonts restored: " + restored + " TMP text(s), " + legacyRestored +
                 " legacy text(s), " + inputRestored + " input field(s)" +
+                (legacySwept > 0
+                    ? ", " + legacySwept + " legacy label(s) moved to '" + legacyFallback.name + "'"
+                    : string.Empty) +
+                (swept > 0 ? ", " + swept + " untracked text(s) moved to the game default" : string.Empty) +
                 (unresolved > 0
                     ? "; " + unresolved + " entry(ies) could not be resolved to a game font and were left as they are"
                     : string.Empty) + ".");
+        }
+
+        /// <summary>
+        /// Best guess for a legacy label whose original font was never snapshotted: the font most other
+        /// legacy labels use, otherwise Unity's built-in font. Null when neither can be found, in which
+        /// case the label is left alone rather than being moved to an arbitrary font.
+        /// </summary>
+        private static Font ResolveLegacyFallbackFont()
+        {
+            UnityEngine.UI.Text[] texts = Resources.FindObjectsOfTypeAll<UnityEngine.UI.Text>();
+            Dictionary<Font, int> counts = new Dictionary<Font, int>();
+            for (int i = 0; i < texts.Length; i++)
+            {
+                UnityEngine.UI.Text text = texts[i];
+                if (text == null || text.font == null || KnownUnityFonts.Contains(text.font))
+                {
+                    continue;
+                }
+
+                int count;
+                counts.TryGetValue(text.font, out count);
+                counts[text.font] = count + 1;
+            }
+
+            Font best = null;
+            int bestCount = 0;
+            foreach (KeyValuePair<Font, int> pair in counts)
+            {
+                Font font = pair.Key;
+                if (font == null)
+                {
+                    continue;
+                }
+
+                int count = pair.Value;
+                if (count > bestCount ||
+                    (count == bestCount && best != null && string.CompareOrdinal(font.name, best.name) < 0))
+                {
+                    best = font;
+                    bestCount = count;
+                }
+            }
+
+            if (best != null)
+            {
+                return best;
+            }
+
+            // Unity 2022 ships LegacyRuntime.ttf; older versions exposed Arial.ttf. Neither is guaranteed
+            // to carry CJK, so this is only the last resort for labels with no snapshot at all.
+            string[] builtinNames = { "LegacyRuntime.ttf", "Arial.ttf" };
+            for (int i = 0; i < builtinNames.Length; i++)
+            {
+                try
+                {
+                    Font builtin = Resources.GetBuiltinResource<Font>(builtinNames[i]);
+                    if (builtin != null && !KnownUnityFonts.Contains(builtin))
+                    {
+                        return builtin;
+                    }
+                }
+                catch (Exception)
+                {
+                    // Try the next built-in name.
+                }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -1967,6 +2850,10 @@ namespace CuFontLoader
         /// </summary>
         internal static void RefreshAllTexts()
         {
+            // Every refresh re-hooks from scratch, so a font switch can never leave the previous asset
+            // referenced by a game font's chain (it must stay collectible by the cache trim below).
+            UnhookFontFallbacks();
+
             ResetSeenState();
             if (!IsReplacementEnabled())
             {
@@ -1997,6 +2884,284 @@ namespace CuFontLoader
         }
 
         /// <summary>
+        /// Hands non-CJK characters back to the game font by dropping them from the plugin fonts'
+        /// character tables. The atlas and its glyphs stay: the guard blocks new adds, and turning
+        /// the option off restores the entries from those glyphs without re-rasterising anything.
+        /// Runs at most once per asset until something invalidates the purity flag.
+        /// </summary>
+        private static int PurgeNonCjkGlyphs()
+        {
+            int removed = NativeGlyphGuard.PurgeAll();
+            if (removed > 0)
+            {
+                Log.LogInfo("[Native] stripped " + removed +
+                    " non-CJK glyph(s) from the plugin font(s); those characters now use the game font.");
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Copies the vertical proportions of a game font onto every plugin font. TMP computes a
+        /// character's ascender/descender from its own font and takes the line's maximum, so a line
+        /// mixing the plugin font's CJK with game-font digits would be stretched to the larger of the
+        /// two. The reference is the font that renders the digits: in PreserveNonCjk mode the game font
+        /// most Chinese texts use (per text), otherwise the first native entry of the fallback chain.
+        /// Returns how many fonts were adjusted.
+        /// </summary>
+        private static int EnsureNativeMetricsForAll()
+        {
+            if (!IsPreserveNonCjkEnabled || AlignNativeMetrics == null || !AlignNativeMetrics.Value)
+            {
+                return 0;
+            }
+
+            TMP_FontAsset reference = ResolveMetricsReference();
+            if (reference == null)
+            {
+                return 0;
+            }
+
+            // The first fallback entry can change when a new game font is used for the first time. The
+            // metrics must follow it, otherwise the line maximum would be taken from another font again.
+            if (reference != s_metricsReference)
+            {
+                if (s_metricsReference != null && NativeMetricsAligned.Count > 0)
+                {
+                    Log.LogInfo(IsPreserveNonCjkEnabled
+                        ? "[Native] line metrics reference is now '" + reference.name + "'; re-aligning."
+                        : "[Native] non-CJK glyphs now come from '" + reference.name + "'; re-aligning line metrics.");
+                }
+
+                s_metricsReference = reference;
+                NativeMetricsAligned.Clear();
+            }
+
+            int applied = 0;
+            foreach (TMP_FontAsset font in KnownFonts)
+            {
+                if (EnsureNativeMetrics(font, reference))
+                {
+                    applied++;
+                }
+            }
+
+            return applied;
+        }
+
+        private static bool EnsureNativeMetrics(TMP_FontAsset font, TMP_FontAsset reference)
+        {
+            if (font == null || reference == null || font == reference ||
+                !NativeMetricsAligned.Add(font))
+            {
+                return false;
+            }
+
+            FaceInfo source = reference.faceInfo;
+            FaceInfo current = font.faceInfo;
+            if (source.pointSize <= 0 || current.pointSize <= 0 || source.lineHeight <= 0f ||
+                source.ascentLine <= 0f)
+            {
+                NativeMetricsAligned.Remove(font);
+                return false;
+            }
+
+            float ratio = (float)current.pointSize / source.pointSize;
+            if (!OriginalFaceInfo.ContainsKey(font))
+            {
+                OriginalFaceInfo[font] = current;
+            }
+
+            FaceInfo aligned = current;
+            aligned.lineHeight = source.lineHeight * ratio;
+            aligned.ascentLine = source.ascentLine * ratio;
+            aligned.descentLine = source.descentLine * ratio;
+            aligned.baseline = source.baseline * ratio;
+            aligned.capLine = source.capLine * ratio;
+            aligned.meanLine = source.meanLine * ratio;
+            aligned.underlineOffset = source.underlineOffset * ratio;
+            aligned.strikethroughOffset = source.strikethroughOffset * ratio;
+            font.faceInfo = aligned;
+
+            FaceInfo applied = font.faceInfo;
+            if (Mathf.Abs(applied.lineHeight - aligned.lineHeight) > 0.01f)
+            {
+                Log.LogWarning("[Native] could not apply line metrics to '" + font.name +
+                    "'; the font keeps its own line spacing.");
+            }
+            else
+            {
+                Log.LogInfo("[Native] line metrics of '" + font.name + "' aligned to '" + reference.name +
+                    "' (x" + ratio.ToString("0.###") + "); " +
+                    (IsPreserveNonCjkEnabled
+                        ? "mixed lines follow that font's line spacing."
+                        : "mixed lines keep the game's line spacing."));
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// In PreserveNonCjk mode the reference is the game font the most Chinese texts use: their
+        /// digits are drawn by that font, so the plugin font's CJK metrics are matched to it. The usage
+        /// is counted during the pass (see PreserveFontUsage), which avoids a second scene scan.
+        /// </summary>
+        private static void UpdatePreserveMetricsReference()
+        {
+            TMP_FontAsset best = null;
+            int bestCount = 0;
+            foreach (KeyValuePair<TMP_FontAsset, int> pair in PreserveFontUsage)
+            {
+                TMP_FontAsset font = pair.Key;
+                if (font == null || IsKnownFont(font))
+                {
+                    continue;
+                }
+
+                int count = pair.Value;
+                if (count > bestCount ||
+                    (count == bestCount && best != null && string.CompareOrdinal(font.name, best.name) < 0))
+                {
+                    best = font;
+                    bestCount = count;
+                }
+            }
+
+            if (best == null || best == s_preserveMetricsReference)
+            {
+                return;
+            }
+
+            s_preserveMetricsReference = best;
+            Log.LogInfo("[Native] line metrics reference: '" + best.name + "' (" + bestCount +
+                " Chinese text(s) use it).");
+        }
+
+        /// <summary>
+        /// The font the plugin font's metrics should follow. With PreserveNonCjk the digits of a text
+        /// are drawn by that text's own font, so the most used one is the only meaningful reference;
+        /// other modes fall back to the first usable entry of the plugin font's chain.
+        /// </summary>
+        private static TMP_FontAsset ResolveMetricsReference()
+        {
+            if (IsPreserveNonCjkEnabled)
+            {
+                TMP_FontAsset preserve = s_preserveMetricsReference;
+                return preserve != null && !KnownFonts.Contains(preserve) ? preserve : null;
+            }
+
+            TMP_FontAsset primary = PrimaryFontAsset;
+            if (primary != null)
+            {
+                List<TMP_FontAsset> chain = primary.fallbackFontAssetTable;
+                if (chain != null)
+                {
+                    for (int i = 0; i < chain.Count; i++)
+                    {
+                        TMP_FontAsset font = chain[i];
+                        if (font != null && !KnownFonts.Contains(font))
+                        {
+                            return font;
+                        }
+                    }
+                }
+            }
+
+            if (s_metricsReference != null && !KnownFonts.Contains(s_metricsReference))
+            {
+                return s_metricsReference;
+            }
+
+            if (Time.unscaledTime < s_nextMetricsReferenceResolve)
+            {
+                return null;
+            }
+
+            s_nextMetricsReferenceResolve = Time.unscaledTime + 5f;
+            try
+            {
+                TMP_FontAsset gameDefault = TMP_Settings.defaultFontAsset;
+                if (gameDefault != null && !KnownFonts.Contains(gameDefault))
+                {
+                    s_metricsReference = gameDefault;
+                    return s_metricsReference;
+                }
+
+                List<TMP_FontAsset> originals = CollectOriginalFonts();
+                if (originals.Count > 0)
+                {
+                    s_metricsReference = originals[0];
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning("Font metrics reference unavailable: " + ex.Message);
+            }
+
+            return s_metricsReference;
+        }
+
+        /// <summary>
+        /// Forces a re-layout of every text that renders at least one glyph from the plugin font.
+        /// SeenTexts alone is not enough: a refresh clears it, and in PreserveNonCjk mode the texts keep
+        /// their own font (only the CJK glyphs come from ours), so they are not tracked there either.
+        /// </summary>
+        private static void MarkSeenTextsDirty(TMP_Text[] allTexts)
+        {
+            foreach (TMP_Text text in SeenTexts)
+            {
+                if (text != null)
+                {
+                    text.SetAllDirty();
+                }
+            }
+
+            if (allTexts == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < allTexts.Length; i++)
+            {
+                TMP_Text text = allTexts[i];
+                if (text == null)
+                {
+                    continue;
+                }
+
+                if (IsKnownFont(text.font) || (IsPreserveNonCjkEnabled && TextHasCjk(text)))
+                {
+                    text.SetAllDirty();
+                }
+            }
+        }
+
+        /// <summary>Puts every adjusted font back on its own metrics (option switched off).</summary>
+        private static void RestoreNativeMetrics()
+        {
+            if (OriginalFaceInfo.Count == 0)
+            {
+                return;
+            }
+
+            foreach (KeyValuePair<TMP_FontAsset, FaceInfo> pair in OriginalFaceInfo)
+            {
+                if (pair.Key != null)
+                {
+                    pair.Key.faceInfo = pair.Value;
+                }
+            }
+
+            OriginalFaceInfo.Clear();
+            NativeMetricsAligned.Clear();
+            s_metricsReference = null;
+            s_nextMetricsReferenceResolve = 0f;
+
+            // The CJK glyphs already on screen still use the aligned metrics; make them regenerate.
+            MarkSeenTextsDirty(Resources.FindObjectsOfTypeAll<TMP_Text>());
+        }
+
+        /// <summary>
         /// Reverts one text to its snapshotted font when it still carries ours but no longer qualifies
         /// (stricter mode, new exclusion, FallbackOnly). The snapshot is kept so it can be re-applied.
         /// The cache memoizes name→asset lookups across one pass.
@@ -2011,7 +3176,13 @@ namespace CuFontLoader
             OriginalTextState state;
             if (!OriginalTmpStates.TryGetValue(text, out state))
             {
-                return;
+                // No snapshot yet (an instance of a replaced prefab): fall back to the game default so
+                // the text does not keep the plugin font after a skip.
+                RememberDefaultSnapshot(text);
+                if (!OriginalTmpStates.TryGetValue(text, out state))
+                {
+                    return;
+                }
             }
 
             TMP_FontAsset original = ResolveFontAsset(state.FontName, state.Font, cache);
@@ -2502,6 +3673,42 @@ namespace CuFontLoader
             return true;
         }
 
+        /// <summary>
+        /// Panel toggle for PreserveNonCjk. Switching on has to strip the non-CJK entries explicitly:
+        /// a glyph that is already in the character table keeps being served no matter what the guard
+        /// allows later. Switching off restores the font's own vertical metrics as well.
+        /// </summary>
+        internal static bool ApplyPanelPreserveNonCjk(bool value)
+        {
+            if (PreserveNonCjk.Value != value)
+            {
+                PreserveNonCjk.Value = value;
+                SaveConfig();
+            }
+
+            if (value)
+            {
+                NativeGlyphGuard.InvalidatePurity();
+                if (AlignNativeMetrics.Value)
+                {
+                    // Re-copy the proportions (the backups are kept) before the screen is rebuilt.
+                    NativeMetricsAligned.Clear();
+                    s_nextMetricsReferenceResolve = 0f;
+                    EnsureNativeMetricsForAll();
+                }
+            }
+            else
+            {
+                RestoreNativeMetrics();
+            }
+
+            RefreshAllTexts();
+            Log.LogInfo("PreserveNonCjk = " + value + " (" +
+                (NativeGlyphGuard.Installed ? "priority fallback + glyph guard" : "priority fallback") + "; " +
+                DescribePrimaryFont() + ")");
+            return true;
+        }
+
         internal static bool ApplyPanelSystemFontPriority(bool value)
         {
             if (SystemFontPriority.Value != value)
@@ -2839,7 +4046,10 @@ namespace CuFontLoader
 
             if (index < LoadedFonts.Count)
             {
-                KnownFonts.Remove(LoadedFonts[index]);
+                TMP_FontAsset removed = LoadedFonts[index];
+                KnownFonts.Remove(removed);
+                NativeMetricsAligned.Remove(removed);
+                OriginalFaceInfo.Remove(removed);
                 LoadedFonts.RemoveAt(index);
             }
 
@@ -2912,6 +4122,26 @@ namespace CuFontLoader
             {
                 Log.LogWarning("Fallback cleanup failed: " + ex.Message);
             }
+
+            // Keep the hook bookkeeping in sync: the tables above already lost our fonts, so a later
+            // UnhookFontFallbacks must not treat these fonts as still hooked (it would restore a null
+            // table that was not null to begin with).
+            foreach (TMP_FontAsset font in HookedFonts)
+            {
+                if (font == null)
+                {
+                    continue;
+                }
+
+                List<TMP_FontAsset> table = font.fallbackFontAssetTable;
+                if (table != null && table.Count == 0 && HookedFontsWithoutTable.Contains(font))
+                {
+                    font.fallbackFontAssetTable = null;
+                }
+            }
+
+            HookedFonts.Clear();
+            HookedFontsWithoutTable.Clear();
         }
 
         private static string DescribePrimaryFont()
@@ -2926,6 +4156,8 @@ namespace CuFontLoader
             SeenInputFields.Clear();
             DecisionLogCache.Clear();
             OriginalAssetLookup.Clear();
+            CjkScanCache.Clear();
+            TextPipelineHooks.ClearQueue();
         }
 
         private static TMP_FontAsset GetPrimaryFontAsset()

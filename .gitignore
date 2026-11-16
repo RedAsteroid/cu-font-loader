@@ -6,3 +6,6 @@ dist/
 
 # Command Code session data
 .commandcode/
+
+# Visual Studio
+.vs/

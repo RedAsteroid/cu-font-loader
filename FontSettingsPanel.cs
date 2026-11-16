@@ -391,6 +391,7 @@ namespace CuFontLoader
         private const string SystemFontOption = OptionRoot + "PanelSystemFont";
         private const string WeightOption = OptionRoot + "PanelFontWeight";
         private const string PriorityOption = OptionRoot + "PanelPriority";
+        private const string PreserveNonCjkOption = OptionRoot + "PanelPreserveNonCjk";
 
         /// <summary>Bilingual UI text; PanelLocale picks the half matching the game language.</summary>
         private struct LocText
@@ -412,14 +413,17 @@ namespace CuFontLoader
 
         private static readonly LocText EnabledLabel = new LocText("启用字体替换", "Enable font replacement");
         private static readonly LocText EnabledDesc = new LocText(
-            "总开关。关闭后不替换任何文本，并还原本插件已替换的字体与材质。",
-            "Master switch. When off, no text is replaced and this plugin reverts everything it changed.");
+            "总开关。关闭后不替换任何文本，并还原本插件替换过的字体、材质以及加入 TMP fallback 链的插件字体。",
+            "Master switch. When off, no text is replaced; this plugin reverts the fonts and materials it changed " +
+            "and removes its font from the TMP fallback chains it extended.");
 
         private static readonly LocText ModeLabel = new LocText("替换模式", "Replace mode");
         private static readonly LocText ModeDesc = new LocText(
-            "FallbackOnly 只回退；Safe 保守替换；Normal 常规替换；Aggressive 强制替换。修改后立即生效。",
+            "FallbackOnly 只回退；Safe 保守替换；Normal 常规替换；Aggressive 强制替换。开启“仅替换中文字形”时三种替换模式行为相同，" +
+            "只把中文字体挂成 fallback，排除规则不参与。修改后立即生效。",
             "FallbackOnly only adds fallbacks; Safe replaces conservative cases; Normal replaces most text; " +
-            "Aggressive forces it. Takes effect immediately.");
+            "Aggressive forces it. With \"CJK glyphs only\" enabled all three behave the same: the plugin font is " +
+            "only hooked as a CJK fallback and exclusions do not apply. Takes effect immediately.");
 
         private static readonly LocText SamplingLabel = new LocText("采样字号", "Sampling size");
         private static readonly LocText SamplingDesc = new LocText(
@@ -451,6 +455,14 @@ namespace CuFontLoader
         private static readonly LocText PriorityDesc = new LocText(
             "开启后系统字体覆盖 fonts 文件夹中的字体文件；关闭后以字体文件为准。",
             "When on, the system font overrides the font file from the fonts folder; when off the font file wins.");
+
+        private static readonly LocText PreserveNonCjkLabel = new LocText(
+            "仅替换中文字形", "CJK glyphs only");
+        private static readonly LocText PreserveNonCjkDesc = new LocText(
+            "用于保留部分游戏字体美术风格：文本保留游戏原字体，插件字体只补中文字形；数字、英文、符号、材质与行距保持原生。英文用户请勿开启，否则英文字体不会生效。",
+            "Purpose: keep part of the game font's art style - texts keep the game font and the plugin font only " +
+            "supplies CJK glyphs, so digits, Latin, symbols, materials and spacing stay native. English users: " +
+            "leave this off, or the selected font will not affect English text.");
 
         private static readonly LocText NotSelectedLabel = new LocText("（未选择）", "(not selected)");
         private static readonly LocText FontsEmptyLabel = new LocText("（fonts 文件夹为空）", "(fonts folder is empty)");
@@ -614,9 +626,14 @@ namespace CuFontLoader
                     registered++;
                 }
 
+                if (RegisterPreserveNonCjkOption())
+                {
+                    registered++;
+                }
+
                 ready = registered > 0;
                 FontLoaderPlugin.Log.LogInfo(
-                    "In-game panel: " + registered + "/7 option(s) registered in the game's Language tab.");
+                    "In-game panel: " + registered + "/8 option(s) registered in the game's Language tab.");
             }
             catch (Exception ex)
             {
@@ -848,6 +865,16 @@ namespace CuFontLoader
                 OnPriorityChanged);
         }
 
+        private static bool RegisterPreserveNonCjkOption()
+        {
+            return CoreLibOptions.RegisterBool(
+                PreserveNonCjkOption,
+                PreserveNonCjkLabel.Value,
+                PreserveNonCjkDesc.Value,
+                FontLoaderPlugin.PreserveNonCjk.Value,
+                OnPreserveNonCjkChanged);
+        }
+
         private static void OnWeightChanged(int index)
         {
             if (IgnoreWhileLoading("FontWeight index=" + index))
@@ -981,6 +1008,17 @@ namespace CuFontLoader
             FontLoaderPlugin.ApplyPanelSystemFontPriority(value);
             PushConfigToPanel();
             RequestTabRefresh();
+        }
+
+        private static void OnPreserveNonCjkChanged(bool value)
+        {
+            if (IgnoreWhileLoading("PreserveNonCjk=" + value))
+            {
+                return;
+            }
+
+            FontLoaderPlugin.ApplyPanelPreserveNonCjk(value);
+            PushConfigToPanel();
         }
 
         /// <summary>
@@ -1161,6 +1199,8 @@ namespace CuFontLoader
                 CoreLibOptions.RegisterOptionText(SystemFontOption, SystemFontLabel.Value, SystemFontDesc.Value);
                 CoreLibOptions.RegisterOptionText(WeightOption, WeightLabel.Value, WeightDesc.Value);
                 CoreLibOptions.RegisterOptionText(PriorityOption, PriorityLabel.Value, PriorityDesc.Value);
+                CoreLibOptions.RegisterOptionText(PreserveNonCjkOption, PreserveNonCjkLabel.Value,
+                    PreserveNonCjkDesc.Value);
 
                 FontLoaderPlugin.FontReplaceMode[] modes = FontLoaderPlugin.PanelModes;
                 for (int i = 0; i < modes.Length && i < ModeLabels.Length; i++)
@@ -1204,6 +1244,7 @@ namespace CuFontLoader
                     systemFontPaths.Length);
                 SetDropdownValue(WeightOption, weightSelection, weightLabels.Length);
                 SetBoolValue(PriorityOption, FontLoaderPlugin.SystemFontPriority.Value);
+                SetBoolValue(PreserveNonCjkOption, FontLoaderPlugin.PreserveNonCjk.Value);
             }
             catch (Exception ex)
             {
