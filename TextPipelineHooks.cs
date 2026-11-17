@@ -121,7 +121,18 @@ namespace CuFontLoader
                     continue;
                 }
 
-                FontLoaderPlugin.ApplySingleText(text);
+                try
+                {
+                    FontLoaderPlugin.ApplySingleText(text);
+                }
+                catch (Exception ex)
+                {
+                    // One broken text must not drop the rest of the queue; the scheduled scan retries it.
+                    if (FontLoaderPlugin.Log != null)
+                    {
+                        FontLoaderPlugin.Log.LogDebug("Applying a discovered text failed: " + ex.Message);
+                    }
+                }
             }
 
             DiscoveryBuffer.Clear();

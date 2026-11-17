@@ -392,6 +392,10 @@ namespace CuFontLoader
         private const string WeightOption = OptionRoot + "PanelFontWeight";
         private const string PriorityOption = OptionRoot + "PanelPriority";
         private const string PreserveNonCjkOption = OptionRoot + "PanelPreserveNonCjk";
+        private const string AlignNativeMetricsOption = OptionRoot + "PanelAlignNativeMetrics";
+
+        /// <summary>Rows this panel registers; only used for the registration summary line.</summary>
+        private const int OptionCount = 9;
 
         /// <summary>Bilingual UI text; PanelLocale picks the half matching the game language.</summary>
         private struct LocText
@@ -459,10 +463,21 @@ namespace CuFontLoader
         private static readonly LocText PreserveNonCjkLabel = new LocText(
             "仅替换中文字形", "CJK glyphs only");
         private static readonly LocText PreserveNonCjkDesc = new LocText(
-            "用于保留部分游戏字体美术风格：文本保留游戏原字体，插件字体只补中文字形；数字、英文、符号、材质与行距保持原生。英文用户请勿开启，否则英文字体不会生效。",
-            "Purpose: keep part of the game font's art style - texts keep the game font and the plugin font only " +
-            "supplies CJK glyphs, so digits, Latin, symbols, materials and spacing stay native. English users: " +
-            "leave this off, or the selected font will not affect English text.");
+            "插件字体只补中文字形，数字、英文、符号、材质保持原生。此功能会导致英文字体失效，非中文语言用户请不要开启。",
+            "Non-Chinese users: leave this off, because English text keeps the game font and the selected " +
+            "font no longer applies to it. The plugin font only supplies CJK glyphs; digits, Latin, symbols " +
+            "and materials stay native.");
+
+        private static readonly LocText AlignNativeMetricsLabel = new LocText(
+            "行距对齐", "Align line metrics");
+        private static readonly LocText AlignNativeMetricsDesc = new LocText(
+            "仅“仅替换中文字形”开启时有效。把插件字体的垂直度量（行高、ascent/descent、基线等）按比例对齐到" +
+            "当前界面中文文本最常用的那款游戏字体，避免中英混排时行距被撑高、基线错位；只调整插件字体自身的 FaceInfo，" +
+            "不改任何文本的字体或材质。关闭后使用插件字体自身度量，切换立即生效。",
+            "Only applies while \"CJK glyphs only\" is on. Aligns the plugin font's vertical metrics (line height, " +
+            "ascent/descent, baseline) proportionally to the game font the Chinese text on screen uses most, so " +
+            "mixed lines are not stretched or shifted; only the plugin font's FaceInfo changes, never a text's " +
+            "font or material. When off the plugin font keeps its own metrics. Takes effect immediately.");
 
         private static readonly LocText NotSelectedLabel = new LocText("（未选择）", "(not selected)");
         private static readonly LocText FontsEmptyLabel = new LocText("（fonts 文件夹为空）", "(fonts folder is empty)");
@@ -631,9 +646,15 @@ namespace CuFontLoader
                     registered++;
                 }
 
+                if (RegisterAlignNativeMetricsOption())
+                {
+                    registered++;
+                }
+
                 ready = registered > 0;
                 FontLoaderPlugin.Log.LogInfo(
-                    "In-game panel: " + registered + "/8 option(s) registered in the game's Language tab.");
+                    "In-game panel: " + registered + "/" + OptionCount +
+                    " option(s) registered in the game's Language tab.");
             }
             catch (Exception ex)
             {
@@ -875,6 +896,16 @@ namespace CuFontLoader
                 OnPreserveNonCjkChanged);
         }
 
+        private static bool RegisterAlignNativeMetricsOption()
+        {
+            return CoreLibOptions.RegisterBool(
+                AlignNativeMetricsOption,
+                AlignNativeMetricsLabel.Value,
+                AlignNativeMetricsDesc.Value,
+                FontLoaderPlugin.AlignNativeMetrics.Value,
+                OnAlignNativeMetricsChanged);
+        }
+
         private static void OnWeightChanged(int index)
         {
             if (IgnoreWhileLoading("FontWeight index=" + index))
@@ -1018,6 +1049,17 @@ namespace CuFontLoader
             }
 
             FontLoaderPlugin.ApplyPanelPreserveNonCjk(value);
+            PushConfigToPanel();
+        }
+
+        private static void OnAlignNativeMetricsChanged(bool value)
+        {
+            if (IgnoreWhileLoading("AlignNativeMetrics=" + value))
+            {
+                return;
+            }
+
+            FontLoaderPlugin.ApplyPanelAlignNativeMetrics(value);
             PushConfigToPanel();
         }
 
@@ -1201,6 +1243,8 @@ namespace CuFontLoader
                 CoreLibOptions.RegisterOptionText(PriorityOption, PriorityLabel.Value, PriorityDesc.Value);
                 CoreLibOptions.RegisterOptionText(PreserveNonCjkOption, PreserveNonCjkLabel.Value,
                     PreserveNonCjkDesc.Value);
+                CoreLibOptions.RegisterOptionText(AlignNativeMetricsOption, AlignNativeMetricsLabel.Value,
+                    AlignNativeMetricsDesc.Value);
 
                 FontLoaderPlugin.FontReplaceMode[] modes = FontLoaderPlugin.PanelModes;
                 for (int i = 0; i < modes.Length && i < ModeLabels.Length; i++)
@@ -1245,6 +1289,7 @@ namespace CuFontLoader
                 SetDropdownValue(WeightOption, weightSelection, weightLabels.Length);
                 SetBoolValue(PriorityOption, FontLoaderPlugin.SystemFontPriority.Value);
                 SetBoolValue(PreserveNonCjkOption, FontLoaderPlugin.PreserveNonCjk.Value);
+                SetBoolValue(AlignNativeMetricsOption, FontLoaderPlugin.AlignNativeMetrics.Value);
             }
             catch (Exception ex)
             {
@@ -1418,7 +1463,13 @@ namespace CuFontLoader
                         continue;
                     }
 
-                    string value = text.text.Trim();
+                    string value = text.text;
+                    if (value == null)
+                    {
+                        continue;
+                    }
+
+                    value = value.Trim();
                     if (string.Equals(value, label.Zh, StringComparison.Ordinal) ||
                         string.Equals(value, label.En, StringComparison.Ordinal))
                     {

@@ -11,7 +11,7 @@
 - **No game asset modification**：不修改游戏资源文件与 AssetBundle，卸载即恢复
 - **Graceful degradation**：CUCoreLib 缺失时面板不注册，功能全部由配置文件驱动
 
-> **v1.5.2** — 「仅替换中文字形」改为优先 fallback：文本保留原字体，数字、英文、符号、材质与行距保持原生，插件字体只补中文；新增逐字字体诊断与 fallback 清理解耦。
+> **v1.5.3** — 修正「仅替换中文字形」切换后的还原：不再改写预制体文本，缺失原字体快照时回退到游戏字体；面板新增「行距对齐」并支持热加载；配置说明改为中英双语。
 
 ## 来源与分支
 
@@ -19,11 +19,11 @@
 |---|---|
 | 上游项目 | [FenChen0211/cu-font-loader](https://github.com/FenChen0211/cu-font-loader) |
 | 本仓库（fork） | [RedAsteroid/cu-font-loader](https://github.com/RedAsteroid/cu-font-loader) |
-| 本分支 | `feat/v1.4.0-pre.1-compatibility`（基于上游同名分支） |
-| 本分支版本 | v1.5.2 |
+| 本分支 | `update`（基于上游 `feat/v1.4.0-pre.1-compatibility`） |
+| 本分支版本 | v1.5.3 |
 | 许可证 | MIT，上游版权归 FenChen0211；详见 [LICENSE](./LICENSE) |
 
-本分支在上游同名分支的基础上继续开发，行为与上游 `main` 不完全一致。反馈请提交到 [Issues](https://github.com/RedAsteroid/cu-font-loader/issues)，附 BepInEx 日志更佳。
+本分支基于上游 `feat/v1.4.0-pre.1-compatibility` 分支继续开发（并非从 `main` 直接拉出），与上游 `main` 的行为不完全一致。反馈请提交到 [Issues](https://github.com/RedAsteroid/cu-font-loader/issues)，附 BepInEx 日志更佳。
 
 ## 安装
 
@@ -54,6 +54,7 @@ BepInEx/
 | 系统字体优先 | 开启后系统字体覆盖 `fonts/` 中的字体文件 |
 | 字重选择 | 当前生效字体的同族字重；无可用项时显示「（未选择）」 |
 | 仅替换中文字形 | 不改字体：中文由插件字体作为首选 fallback 补字，数字/英文保持游戏原字体 |
+| 行距对齐 | 仅「仅替换中文字形」开启时有效；把插件字体的垂直度量对齐到当前界面最常用的游戏字体，切换立即生效 |
 
 - cfg 是唯一的配置来源：面板改动立即写入 cfg，打开设置页时按 cfg 显示
 - 「字体文件」下拉每次打开都重新扫描 `fonts/`，运行中新增的字体无需重启
@@ -165,7 +166,7 @@ SystemFontPriority = false
 PreserveNonCjk = false
 ```
 
-对应面板「仅替换中文字形」。开启后**不改写 TMP 文本的字体**（旧版 `UI.Text` 见下表）：文本继续使用游戏原来的 FontAsset（数字、英文字母、符号、材质与行距都保持原生），插件字体只作为该字体的**首选 fallback**，用于补上它画不出来的中文字形：
+对应面板「仅替换中文字形」。开启后**不改写 TMP 文本的字体**（旧版 `UI.Text` 见下表）：文本继续使用游戏原来的 FontAsset（数字、英文字母、符号与材质保持原生；行距默认按参考字体对齐，见下文「行距对齐」），插件字体只作为该字体的**首选 fallback**，用于补上它画不出来的中文字形：
 
 | 文本 | 行为 |
 |---|---|
@@ -175,15 +176,17 @@ PreserveNonCjk = false
 | `TMP_InputField` | 字体保持原样，输入中文时由 fallback 补字 |
 
 - **英文用户不要开启**：开启后英文文本仍由游戏原字体渲染，所选英文字体不会生效；需要字体作用于英文时请关闭本项
-- 插件字体被插入到**文本原字体的 fallback 链首位**（同时进入 TMP 全局 fallback 首位），因此中文优先用插件字体，而不是游戏/翻译 Mod 的兜底字体
-- 不改 `text.text`、不注入富文本标签、不加组件、不换材质：数字/英文的字体、材质与行距与游戏原生完全一致
+- 插件字体被插入到**文本原字体的 fallback 链首位**（同时进入 TMP 全局 fallback 首位），因此中文优先用插件字体，而不是游戏/翻译 Mod 的字体
+- 不改 `text.text`、不注入富文本标签、不加组件、不换材质：数字/英文的字体与材质保持原生，行距由下方「行距对齐」决定
 - 因为不再"每个文本换字体"，开启/切换后不会再有 0–1 秒的替换延迟或闪烁，新文本也不需要等待扫描
 - 性能：每帧只有一次空的发现队列检查；每 `ScanIntervalSeconds` 遍历一次已加载文本（缓存命中时每文本一次字符串引用比较），并做一次可回收字形清洗，CPU 开销低于普通替换模式。混排文本会多出一个由 fallback 材质绘制的 sub-mesh，同一画布按材质合批，通常只增加少量 draw call
-- **行距对齐**（`[Font] AlignNativeMetrics`，默认开启）：混排行高取行内字符所属字体的 ascender/descender 最大值，插件会把自己的垂直度量按比例对齐到**当前界面里中文文本最常用的那款游戏字体**（每轮扫描统计），并在参考字体变化时重新对齐
+- **行距对齐**（`[Font] AlignNativeMetrics`，默认开启，面板可切换）：混排行高取行内字符所属字体的 ascender/descender 最大值，插件会把自己的垂直度量按比例对齐到**当前界面里中文文本最常用的那款游戏字体**（每轮扫描统计），并在参考字体变化时重新对齐；面板切换立即生效
 - 退出该模式（关闭开关、切到 `FallbackOnly`、禁用插件、取消字体选择）时，会把插件字体从所有被扩展的 fallback 链中移除，并还原曾被替换的文本
 - 开启时仍会剔除插件字体里已有的非 CJK 字形，中文按需加入图集
+- 不修改预制体（prefab）里的文本：只处理屏幕上真实存在的对象，避免把插件字体写进预制体后，新生成的界面元素一出生就带着插件字体
+- 少数界面元素是从"替换期间被改过的模板"克隆出来的，没有自己的原字体快照；插件会把它换成一款游戏原生字体（优先选当前界面中文文本最常用的那款），而不是让它继续用插件字体
 - `Safe` / `Normal` / `Aggressive` 下行为一致（本模式不改写字体/材质，排除规则与材质保护自然也不参与）；`FallbackOnly` 下不生效
-- 日志：`[Native] native font coverage: …` 打印当前可达的原生字体；`[Native] '…' takes U+XXXX …` 记录确实没有原生字形、只能由插件字体补的字符（需 `CompatibilityLog` 或 `LogTextDetails`）
+- 日志：`[Native] native font coverage: …` 打印当前可达的原生字体；`[Native] '…' takes U+XXXX …` 记录确实没有原生字形、只能由插件字体补的字符（需 `CompatibilityLog` 或 `LogTextDetails`）；面板切到「开启」后的下一次扫描会自检并输出 `[Preserve] check after switching on: …`，正常时确认所有非中文字符都由游戏字体绘制，异常时给出文本数量与对象名
 - 改 cfg 后需重启；游戏内切换立即生效
 
 ## 兼容性保护（Compatibility）
@@ -288,7 +291,7 @@ A 查不到的中文字形 → B（链首）；B 也没有 → 链上其余字�
 - **系统字体**只在「系统字体优先」开启时使用
 - 外部字体**不含中文字形**时，中文由游戏原字体渲染
 - 销毁缓存资产后切回该字号会重新解析文件（LRU 销毁机制）
-- **仅替换中文字形**下，行距按 `AlignNativeMetrics` 对齐到当前界面最常用的游戏字体；若某条文本的原字体与参考字体度量差异很大，仍可能有细微差别，可关闭该开关改用插件字体自身度量
+- **仅替换中文字形**下，行距按 `AlignNativeMetrics` 对齐到当前界面最常用的游戏字体；若某条文本的原字体与参考字体度量差异很大，仍可能有细微差别，可在面板「行距对齐」里关闭它，改用插件字体自身度量
 - 新文本发现依赖 TMP 渲染器的 `OnEnable` 钩子；钩子安装失败时退回周期扫描（≤ `ScanIntervalSeconds`）与场景加载后的补扫
 - 替换模式下，回落到游戏字体的字符使用游戏字体自身的材质；`PreserveCustomMaterials = true` 会跳过使用自定义材质的文本（`PreserveNonCjk` 模式不换材质，不受此影响）
 - 旧版 `UI.Text` 没有逐字回退能力，「仅替换中文字形」只对"纯中文"标签整段替换，含数字/英文的保持原生
@@ -301,9 +304,10 @@ A 查不到的中文字形 → B（链首）；B 也没有 → 链上其余字�
 2. Steam 注册表 `HKCU\Software\Valve\Steam\SteamPath` + `\steamapps\common\Casualties Unknown`（仅完整框架 MSBuild 可用，`dotnet build` 跳过）
 3. `cu-font-loader.csproj` 自定义路径
 
-命令行传入 `GameDir`：
+命令行传入 `GameDir`。下面是示例命令，`D:\path\to\Casualties Unknown` 是占位路径，需要换成你自己的游戏安装目录：
 
 ```powershell
+# 示例：把路径替换为实际的游戏安装目录
 dotnet build -p:GameDir="D:\path\to\Casualties Unknown"
 ```
 
@@ -313,7 +317,7 @@ dotnet build -p:GameDir="D:\path\to\Casualties Unknown"
 bin/cu-font-loader.dll
 ```
 
-`GameDir` 指向包含 `BepInEx/` 与 `CasualtiesUnknown_Data/` 的游戏根目录。`CUCoreLib-1.1/` 仅作 API 参考，已通过 `<Compile Remove>` 排除。
+`GameDir` 指向包含 `BepInEx/` 与 `CasualtiesUnknown_Data/` 的游戏根目录。`CUCoreLib` 只在运行时通过反射探测，编译不依赖它。
 
 ## 项目结构
 
@@ -323,8 +327,7 @@ cu-font-loader/
   cu-font-loader.sln      Visual Studio 解决方案
   FontLoaderPlugin.cs     插件主体：配置、扫描、替换、fallback、还原
   NativeGlyphGuard.cs     CJK 字形守卫：TMP 加字前缀、CJK 判定、字形清洗
-  FontSettingsPanel.cs    设置面板：CUCoreLib 注册、钩子、双语文案
-  CUCoreLib-1.1/          CUCoreLib 参考源码（不参与编译）
+  FontSettingsPanel.cs    设置面板：面板项注册（运行时反射接 CUCoreLib，无编译期引用）、钩子、双语文案
   LICENSE                 MIT 许可证
 ```
 

@@ -277,6 +277,16 @@ namespace CuFontLoader
             return true;
         }
 
+        /// <summary>
+        /// True when any reachable native font can render this character. Diagnostics use it to tell a
+        /// glyph the plugin font had to take (no game font has it) apart from one it should have left to
+        /// a game font.
+        /// </summary>
+        internal static bool HasNativeGlyph(uint unicode)
+        {
+            return AnyNativeProviderHasGlyph(unicode);
+        }
+
         private static bool AnyNativeProviderHasGlyph(uint unicode)
         {
             for (int i = 0; i < NativeProviders.Count; i++)
