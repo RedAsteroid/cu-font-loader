@@ -16,7 +16,7 @@ using UnityEngine.TextCore.LowLevel;
 
 namespace CuFontLoader
 {
-    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.3")]
+    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.5.4")]
     [BepInDependency("net.cucorelib", BepInDependency.DependencyFlags.SoftDependency)]
     public class FontLoaderPlugin : BaseUnityPlugin
     {
@@ -671,6 +671,27 @@ namespace CuFontLoader
                 }
 
                 return GetEffectiveMode() != FontReplaceMode.FallbackOnly;
+            }
+        }
+
+        /// <summary>
+        /// True when a newly enabled text can be re-fonted immediately in the OnEnable postfix.
+        /// Safe mode and the CJK-only mode inspect the text's content, so they still go through the
+        /// next-frame queue; the replacement modes only need the font and material state.
+        /// </summary>
+        internal static bool CanApplyOnTextEnabled
+        {
+            get
+            {
+                if (ReplaceMode == null)
+                {
+                    return false;
+                }
+
+                FontReplaceMode mode = GetEffectiveMode();
+                return mode != FontReplaceMode.FallbackOnly &&
+                    mode != FontReplaceMode.Safe &&
+                    !IsPreserveNonCjkEnabled;
             }
         }
 

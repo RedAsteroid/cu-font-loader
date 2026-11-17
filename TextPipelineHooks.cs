@@ -4,8 +4,10 @@
 //
 // A newly enabled text used to wait for the next scheduled scan (up to ScanIntervalSeconds) before it
 // was considered. This covers both modes: PreserveNonCjk only has to hook the text font's fallback
-// chain once, while replacement modes decide and apply the font. The OnEnable postfix queues the text
-// and the queue is flushed every frame, so it is handled on the next frame instead.
+// chain once, while replacement modes decide and apply the font. Replacement modes that do not depend
+// on the text's content apply immediately in the OnEnable postfix, because UI rows that are rebuilt
+// every frame (trade windows, pooled lists) would otherwise show the game font until the next flush.
+// Safe mode and PreserveNonCjk still queue, since they inspect the text content.
 
 using System;
 using System.Collections.Generic;
@@ -91,6 +93,21 @@ namespace CuFontLoader
                 if (__instance == null || !FontLoaderPlugin.IsReplacementEnabled())
                 {
                     return;
+                }
+
+                if (FontLoaderPlugin.CanApplyOnTextEnabled)
+                {
+                    try
+                    {
+                        // UI rebuilds create a text and render it in the same frame; waiting for the
+                        // next flush would show the prefab's game font first. Apply now, and still queue
+                        // the text so the deferred pass can retry if TMP was not fully initialised yet.
+                        FontLoaderPlugin.ApplySingleText(__instance);
+                    }
+                    catch (Exception)
+                    {
+                        // The queued pass below retries it.
+                    }
                 }
 
                 DiscoveryQueue.Add(__instance);
