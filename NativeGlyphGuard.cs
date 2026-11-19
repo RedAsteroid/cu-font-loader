@@ -8,7 +8,7 @@
 // character table, then calls TryAddCharacterInternal when the asset is Dynamic, then recurses into
 // fallbackFontAssetTable). Keeping digits, Latin letters and symbols on the game's font therefore
 // means answering "not mine" at that add step, which is what this guard hooks. It is a prefix, it
-// fails open, and it only ever runs for the font assets this plugin created.
+// only runs for the font assets this plugin created, and it refuses every non-CJK character.
 
 using System;
 using System.Collections.Generic;
@@ -16,6 +16,7 @@ using System.Reflection;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
+using UnityEngine.TextCore;
 
 namespace CuFontLoader
 {
@@ -42,12 +43,13 @@ namespace CuFontLoader
         private static readonly List<TMP_FontAsset> ProviderQueue = new List<TMP_FontAsset>();
         private static readonly HashSet<TMP_FontAsset> ProviderSeen = new HashSet<TMP_FontAsset>();
         private static readonly List<TMP_FontAsset> PreviousProviders = new List<TMP_FontAsset>();
-
-        /// <summary>Codes already reported once when the plugin font had to take them.</summary>
-        private static readonly HashSet<uint> LoggedTakenGlyphs = new HashSet<uint>();
+        private static bool providersChanged;
 
         /// <summary>True after the "no native coverage" warning was written, so it is logged once.</summary>
         private static bool reportedEmptyProviders;
+
+        /// <summary>Code points already reported as mapped to an empty glyph, so each is logged once.</summary>
+        private static readonly HashSet<uint> LoggedBlankGlyphs = new HashSet<uint>();
 
         internal static bool Installed
         {
@@ -88,10 +90,23 @@ namespace CuFontLoader
                     return false;
                 }
 
+                // The prefix is the guard itself; the postfix is a diagnostic. Patch them separately so
+                // a binding problem in the diagnostic cannot leave the plugin without its guard.
                 Harmony harmony = new Harmony("fenchen.cu-font-loader.nativeglyph");
                 harmony.Patch(target,
                     prefix: new HarmonyMethod(typeof(NativeGlyphGuard), nameof(BeforeAddCharacter)));
                 s_harmony = harmony;
+
+                try
+                {
+                    harmony.Patch(target, postfix: new HarmonyMethod(typeof(NativeGlyphGuard),
+                        nameof(AfterAddCharacter)));
+                }
+                catch (Exception ex)
+                {
+                    LogWarning("Empty-glyph diagnostics not installed: " + ex.Message);
+                }
+
                 return true;
             }
             catch (Exception ex)
@@ -103,8 +118,8 @@ namespace CuFontLoader
 
         /// <summary>
         /// Returning false skips the dynamic glyph add, so TMP keeps looking and finds the character
-        /// in the game's own font. Every check fails open: a digit drawn in the replacement font is
-        /// far better than a missing glyph box.
+        /// in the game's own font. An exception fails open (the glyph is added) so a guard bug can
+        /// never leave text blank; the CJK classification itself is strict.
         /// </summary>
         private static bool BeforeAddCharacter(TMP_FontAsset __instance, uint unicode,
             ref TMP_Character character)
@@ -121,26 +136,63 @@ namespace CuFontLoader
                     return true;
                 }
 
-                if (CjkText.IsCjk(unicode))
+                if (CjkText.IsCjkGlyph(unicode))
                 {
                     return true;
                 }
 
-                if (AnyNativeProviderHasGlyph(unicode))
-                {
-                    // TMP will find the character in one of the native fonts, so keep it out of ours.
-                    // Mirrors what GetTextElement does: own chain, global list, game default - and each
-                    // of those fonts' own fallback tables.
-                    character = null;
-                    return false;
-                }
-
-                LogTakenGlyph(__instance, unicode);
-                return true;
+                // Non-CJK stays native even when no game font can draw it: a missing glyph is
+                // preferable to the plugin font owning a character it does not classify as CJK.
+                // This also covers TMP_Settings' global fallback list, which bypasses the chain
+                // configured on the text's own font.
+                character = null;
+                return false;
             }
             catch (Exception)
             {
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// Reports a CJK character that the plugin font maps to an empty outline. TMP counts such a
+        /// character as found, so it renders blank instead of falling back to a game font; that is a
+        /// font-quality problem the plugin cannot fix from here, and it is worth finding during
+        /// translation QA. Logged once per code point, and only with the detailed switches on.
+        /// </summary>
+        private static void AfterAddCharacter(TMP_FontAsset __instance, uint unicode, bool __result,
+            ref TMP_Character character)
+        {
+            try
+            {
+                if (!__result || character == null || __instance == null ||
+                    !FontLoaderPlugin.IsKnownFont(__instance) || !CjkText.IsCjk(unicode) ||
+                    (unicode <= 0xFFFF && char.IsWhiteSpace((char)unicode)))
+                {
+                    return;
+                }
+
+                Glyph glyph = character.glyph;
+                if (glyph == null || (glyph.glyphRect.width > 0f && glyph.glyphRect.height > 0f))
+                {
+                    return;
+                }
+
+                bool detailed = (FontLoaderPlugin.CompatibilityLog != null &&
+                                 FontLoaderPlugin.CompatibilityLog.Value) ||
+                                (FontLoaderPlugin.LogTextDetails != null &&
+                                 FontLoaderPlugin.LogTextDetails.Value);
+                if (!detailed || LoggedBlankGlyphs.Count >= 200 || !LoggedBlankGlyphs.Add(unicode))
+                {
+                    return;
+                }
+
+                LogWarning("[Native] '" + __instance.name + "' maps U+" + unicode.ToString("X4") +
+                    " to an empty glyph; it renders blank instead of falling back to a game font.");
+            }
+            catch (Exception)
+            {
+                // Diagnostics must never disturb TMP's glyph path.
             }
         }
 
@@ -199,6 +251,7 @@ namespace CuFontLoader
                 PreviousProviders.Clear();
                 PreviousProviders.AddRange(NativeProviders);
                 Purified.Clear();
+                providersChanged = true;
 
                 if (NativeProviders.Count == 0)
                 {
@@ -308,25 +361,6 @@ namespace CuFontLoader
         }
 
         /// <summary>
-        /// Reports once (with CompatibilityLog on) which characters only the plugin font could render,
-        /// so a glyph that is really missing from the game can be told apart from a routing mistake.
-        /// </summary>
-        private static void LogTakenGlyph(TMP_FontAsset asset, uint unicode)
-        {
-            bool detailed = (FontLoaderPlugin.CompatibilityLog != null &&
-                             FontLoaderPlugin.CompatibilityLog.Value) ||
-                            (FontLoaderPlugin.LogTextDetails != null &&
-                             FontLoaderPlugin.LogTextDetails.Value);
-            if (!detailed || !LoggedTakenGlyphs.Add(unicode))
-            {
-                return;
-            }
-
-            LogInfo("[Native] '" + asset.name + "' takes U+" + unicode.ToString("X4") +
-                " because no game font can render it.");
-        }
-
-        /// <summary>
         /// Static assets answer from their character table. A dynamic asset is asked through TMP's
         /// own resolver, which adds the glyph the same way it would for native text; that keeps the
         /// answer honest for fonts that only populate their atlas on demand.
@@ -383,7 +417,7 @@ namespace CuFontLoader
                     continue;
                 }
 
-                if (CjkText.IsCjk(entry.unicode))
+                if (CjkText.IsCjkGlyph(entry.unicode))
                 {
                     if (kept != null)
                     {
@@ -463,6 +497,15 @@ namespace CuFontLoader
             return removed;
         }
 
+        /// <summary>True once after the reachable native fonts changed; the caller can then run
+        /// PurgeRecoverable instead of scanning every plugin glyph on every scan pass.</summary>
+        internal static bool TakeProvidersChanged()
+        {
+            bool changed = providersChanged;
+            providersChanged = false;
+            return changed;
+        }
+
         /// <summary>
         /// Hands back only the glyphs the native fonts can render now. Unlike PurgeAll this is safe to
         /// run on every pass: a character no game font provides stays in the plugin font (no boxes),
@@ -502,7 +545,7 @@ namespace CuFontLoader
                     continue;
                 }
 
-                if (CjkText.IsCjk(entry.unicode) || !AnyNativeProviderHasGlyph(entry.unicode))
+                if (CjkText.IsCjkGlyph(entry.unicode) || !AnyNativeProviderHasGlyph(entry.unicode))
                 {
                     if (kept != null)
                     {
@@ -561,28 +604,62 @@ namespace CuFontLoader
     }
 
     /// <summary>
-    /// Character classification for "CJK is ours, everything else stays native". The ranges are
-    /// deliberately the single place to edit when that rule needs adjusting: fullwidth forms are
-    /// treated as CJK because they belong to Chinese typography, while general punctuation,
-    /// symbols and emoji stay on the game font.
+    /// Character classification for "CJK is ours, everything else stays native": Chinese and Japanese
+    /// ideographs, Japanese kana, Korean Hangul, and the punctuation and fullwidth forms that belong to
+    /// those scripts. Shared punctuation such as curly quotes, dashes and ellipsis is a separate
+    /// exception handled by IsCjkPunctuation: the guard may keep it in a plugin font, and a legacy
+    /// pure-CJK label may contain it only when it also contains a real CJK character. Other general
+    /// punctuation, symbols and emoji stay on the game font.
     /// </summary>
     internal static class CjkText
     {
         internal static bool IsCjk(uint codePoint)
         {
-            return (codePoint >= 0x2E80 && codePoint <= 0x2FFF) ||   // radicals, Kangxi, IDS
+            return (codePoint >= 0x1100 && codePoint <= 0x11FF) ||   // Hangul Jamo
+                   (codePoint >= 0x2E80 && codePoint <= 0x2FFF) ||   // radicals, Kangxi, IDS
                    (codePoint >= 0x3000 && codePoint <= 0x303F) ||   // CJK symbols and punctuation
                    (codePoint >= 0x3040 && codePoint <= 0x30FF) ||   // hiragana, katakana
-                   (codePoint >= 0x3100 && codePoint <= 0x31FF) ||   // bopomofo, kanbun, strokes
+                   (codePoint >= 0x3100 && codePoint <= 0x31FF) ||   // bopomofo, kanbun, Hangul compat Jamo
                    (codePoint >= 0x3200 && codePoint <= 0x33FF) ||   // enclosed CJK, compatibility
                    (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||   // extension A
                    (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||   // unified ideographs
+                   (codePoint >= 0xA960 && codePoint <= 0xA97F) ||   // Hangul Jamo Extended-A
+                   (codePoint >= 0xAC00 && codePoint <= 0xD7A3) ||   // Hangul syllables
+                   (codePoint >= 0xD7B0 && codePoint <= 0xD7FF) ||   // Hangul Jamo Extended-B
                    (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // compatibility ideographs
                    (codePoint >= 0xFE10 && codePoint <= 0xFE1F) ||   // vertical forms
                    (codePoint >= 0xFE30 && codePoint <= 0xFE4F) ||   // compatibility forms
+                   (codePoint >= 0xFE50 && codePoint <= 0xFE6F) ||   // small form variants
                    (codePoint >= 0xFF00 && codePoint <= 0xFFEF) ||   // halfwidth and fullwidth forms
                    (codePoint >= 0x1F200 && codePoint <= 0x1F2FF) || // enclosed ideographic supplement
                    (codePoint >= 0x20000 && codePoint <= 0x3FFFF);   // extensions B-G
+        }
+
+        /// <summary>
+        /// Punctuation shared by CJK and Latin typography. It is deliberately not part of IsCjk:
+        /// classifying it globally would make English paragraphs count as CJK. The guard may keep
+        /// these glyphs in a plugin font, and a legacy pure-CJK label may contain them only when it
+        /// also contains a real CJK character.
+        /// </summary>
+        internal static bool IsCjkPunctuation(uint codePoint)
+        {
+            return codePoint == 0x00B7 ||   // middle dot
+                   codePoint == 0x2013 ||   // en dash
+                   codePoint == 0x2014 ||   // em dash
+                   codePoint == 0x2015 ||   // horizontal bar
+                   codePoint == 0x2018 ||   // left single quotation mark
+                   codePoint == 0x2019 ||   // right single quotation mark
+                   codePoint == 0x201C ||   // left double quotation mark
+                   codePoint == 0x201D ||   // right double quotation mark
+                   codePoint == 0x2025 ||   // two dot leader
+                   codePoint == 0x2026 ||   // ellipsis
+                   codePoint == 0x2027 ||   // hyphenation point
+                   codePoint == 0x203B;     // reference mark
+        }
+
+        internal static bool IsCjkGlyph(uint codePoint)
+        {
+            return IsCjk(codePoint) || IsCjkPunctuation(codePoint);
         }
 
         /// <summary>
@@ -608,6 +685,13 @@ namespace CuFontLoader
                 if (IsCjk(character))
                 {
                     hasCjk = true;
+                    continue;
+                }
+
+                if (IsCjkPunctuation(character))
+                {
+                    // Shared punctuation is allowed around a CJK label, but does not make a
+                    // punctuation-only string count as CJK.
                     continue;
                 }
 
@@ -641,9 +725,10 @@ namespace CuFontLoader
             for (int i = 0; i < text.Length; i++)
             {
                 char character = text[i];
-                if (character < 0x2E80)
+                if (character < 0x1100)
                 {
-                    // ASCII, Latin, Greek, Cyrillic, general punctuation: never CJK.
+                    // ASCII, Latin, Greek, Cyrillic and everything below the first Hangul block is
+                    // never CJK, which keeps the common case to one comparison per character.
                     continue;
                 }
 

@@ -17,6 +17,7 @@ using System.IO;
 using System.Reflection;
 using HarmonyLib;
 using TMPro;
+using UnityEngine;
 
 namespace CuFontLoader
 {
@@ -318,6 +319,7 @@ namespace CuFontLoader
             }
             catch (Exception)
             {
+                // PlayerPrefs unavailable: fall through to the game locale and the system language.
             }
 
             if (string.IsNullOrEmpty(raw))
@@ -392,10 +394,11 @@ namespace CuFontLoader
         private const string WeightOption = OptionRoot + "PanelFontWeight";
         private const string PriorityOption = OptionRoot + "PanelPriority";
         private const string PreserveNonCjkOption = OptionRoot + "PanelPreserveNonCjk";
+        private const string CjkOverrideOption = OptionRoot + "PanelCjkOverride";
         private const string AlignNativeMetricsOption = OptionRoot + "PanelAlignNativeMetrics";
 
         /// <summary>Rows this panel registers; only used for the registration summary line.</summary>
-        private const int OptionCount = 9;
+        private const int OptionCount = 10;
 
         /// <summary>Bilingual UI text; PanelLocale picks the half matching the game language.</summary>
         private struct LocText
@@ -423,61 +426,83 @@ namespace CuFontLoader
 
         private static readonly LocText ModeLabel = new LocText("替换模式", "Replace mode");
         private static readonly LocText ModeDesc = new LocText(
-            "FallbackOnly 只回退；Safe 保守替换；Normal 常规替换；Aggressive 强制替换。开启“仅替换中文字形”时三种替换模式行为相同，" +
-            "只把中文字体挂成 fallback，排除规则不参与。修改后立即生效。",
-            "FallbackOnly only adds fallbacks; Safe replaces conservative cases; Normal replaces most text; " +
-            "Aggressive forces it. With \"CJK glyphs only\" enabled all three behave the same: the plugin font is " +
-            "only hooked as a CJK fallback and exclusions do not apply. Takes effect immediately.");
+            "选择文本替换方式，推荐优先使用 Normal；替换后行高或基线变化明显时改用 ScaleAware。" +
+            "FallbackOnly 只把插件字体加入 TMP 回退链；Safe 跳过含 Sprite 或受保护材质的文本；" +
+            "Aggressive 每轮强制替换；Consistent 在字体被游戏改回后重新应用。" +
+            "开启“仅替换中日韩字形”后，除 FallbackOnly 外各模式行为相同，只把插件字体作为 CJK 字形回退。" +
+            "切换后立即生效。",
+            "Choose how text is replaced; Normal suits most setups, and ScaleAware replaces a noticeable shift " +
+            "in line height or baseline. FallbackOnly only adds the plugin font to TMP's fallback chain; Safe " +
+            "skips text with sprites or protected materials; Aggressive forces replacement every pass; " +
+            "Consistent re-applies after the game resets the font. With \"CJK glyphs only\" on, every mode " +
+            "except FallbackOnly behaves the same and only hooks the plugin font as a CJK fallback. Applies " +
+            "immediately.");
 
         private static readonly LocText SamplingLabel = new LocText("采样字号", "Sampling size");
         private static readonly LocText SamplingDesc = new LocText(
             "创建字体图集时使用的采样字号，默认 {0} px，不改变界面文字的实际大小。" +
-            "修改后重建当前字体的图集并立即重新应用；切回用过的档位会复用已建好的图集。",
+            "修改后重建当前字体的图集并重新应用；切回用过的档位会复用已建好的图集。",
             "Sampling point size used when the font atlas is built (default {0} px); it does not change the " +
-            "on-screen text size. Changing it rebuilds the atlas of the font in effect and re-applies " +
-            "immediately; a size that was used before reuses its cached atlas.");
+            "on-screen text size. Changing it rebuilds the atlas of the font in effect and re-applies; a size " +
+            "that was used before reuses its cached atlas.");
 
         private static readonly LocText FontFileLabel = new LocText("字体文件", "Font file");
         private static readonly LocText FontFileDesc = new LocText(
-            "把 .ttf / .otf 字体文件放入 {0}，重新打开本下拉即会重新扫描；选中后立即应用，仅在“系统字体优先”关闭时生效。",
+            "把 .ttf / .otf 字体文件放入 {0}，重新打开本下拉即会重新扫描；选中后立即应用。" +
+            "“系统字体优先”关闭时由它接管，留空且关闭时不替换任何文本。",
             "Put .ttf / .otf font files into {0}, then reopen this dropdown to rescan. The selected font is " +
-            "applied immediately and used only while \"System font priority\" is off.");
+            "applied immediately; it is the source while \"System font priority\" is off, and leaving it " +
+            "empty with the priority off applies no font.");
 
         private static readonly LocText SystemFontLabel = new LocText("系统字体", "System font");
         private static readonly LocText SystemFontDesc = new LocText(
-            "Windows 已安装字体，仅在“系统字体优先”开启时生效；加载失败时保持当前字体不变。",
-            "Installed Windows fonts, used only while \"System font priority\" is on; a failed load keeps the " +
-            "current font.");
+            "Windows 已安装字体，仅在“系统字体优先”开启时作为字体来源；关闭时即使有值也不生效。" +
+            "加载失败时保持当前字体不变。选择“（未选择）”清除该系统字体。",
+            "Installed Windows fonts, used as the font source only while \"System font priority\" is on " +
+            "(the value is ignored when it is off); a failed load keeps the current font. \"(not selected)\" " +
+            "clears the choice.");
 
         private static readonly LocText WeightLabel = new LocText("字重选择", "Font weight");
         private static readonly LocText WeightDesc = new LocText(
-            "选择当前生效字体的字重。可用项取决于“字体文件”或“系统字体优先”所指的字族；切换后立即重新应用。",
-            "Weight of the font currently in effect. The choices follow the family of the font file, or of the " +
-            "system font while its priority is on; switching re-applies immediately.");
+            "选择当前生效字体的字重。可用项跟随当前字体来源；切换后立即重新应用。",
+            "Weight of the font currently in effect. The choices follow the font source in use; " +
+            "switching re-applies immediately.");
 
         private static readonly LocText PriorityLabel = new LocText("系统字体优先", "System font priority");
         private static readonly LocText PriorityDesc = new LocText(
-            "开启后系统字体覆盖 fonts 文件夹中的字体文件；关闭后以字体文件为准。",
-            "When on, the system font overrides the font file from the fonts folder; when off the font file wins.");
+            "决定字体来源：开启时用系统字体，关闭时用字体文件；所选来源未选择时不替换任何文本，由游戏原字体渲染。",
+            "Selects the font source: the system font when on, the font file when off. With the selected " +
+            "source empty nothing is replaced and the game's own fonts render the text.");
 
         private static readonly LocText PreserveNonCjkLabel = new LocText(
-            "仅替换中文字形", "CJK glyphs only");
+            "仅替换中日韩字形", "CJK glyphs only");
         private static readonly LocText PreserveNonCjkDesc = new LocText(
-            "插件字体只补中文字形，数字、英文、符号、材质保持原生。此功能会导致英文字体失效，非中文语言用户请不要开启。",
-            "Non-Chinese users: leave this off, because English text keeps the game font and the selected " +
-            "font no longer applies to it. The plugin font only supplies CJK glyphs; digits, Latin, symbols " +
-            "and materials stay native.");
+            "推荐开启。插件字体只补中日韩字形（中文、日文假名、韩文谚文），数字、英文、符号、材质保持原生。" +
+            "此功能会导致英文字体失效，只需要英文的用户请不要开启；韩文需要所选字体本身带谚文字形。",
+            "Recommended and on by default. The plugin font only supplies CJK glyphs (Chinese, Japanese kana, " +
+            "Korean Hangul); digits, Latin, symbols and materials stay native. Because English text keeps the " +
+            "game font, English-only users should leave this off. Korean needs a font that contains Hangul.");
+
+        private static readonly LocText CjkOverrideLabel = new LocText(
+            "中日韩字体替换白名单", "CJK font replacement whitelist");
+        private static readonly LocText CjkOverrideDesc = new LocText(
+            "仅“仅替换中日韩字形”开启时有效。白名单中的游戏字体（默认 ScienceUnifont、ConsoleFont）" +
+            "即使自带 CJK 字形，也优先由插件字体替换 CJK 文字；数字、英文和符号仍保持原字体。" +
+            "关闭该模式后，这些字体按普通文本处理，替换模式下会被整体替换。默认开启，切换立即生效。",
+            "Only applies while \"CJK glyphs only\" is on. For game fonts in the whitelist (ScienceUnifont " +
+            "and ConsoleFont by default), the plugin font takes over CJK text even if the source font already " +
+            "contains CJK glyphs; digits, Latin and symbols stay on the source font. With the mode off, these " +
+            "fonts are treated like any other text and replaced wholesale in replacement modes. On by default; " +
+            "applies immediately.");
 
         private static readonly LocText AlignNativeMetricsLabel = new LocText(
             "行距对齐", "Align line metrics");
         private static readonly LocText AlignNativeMetricsDesc = new LocText(
-            "仅“仅替换中文字形”开启时有效。把插件字体的垂直度量（行高、ascent/descent、基线等）按比例对齐到" +
-            "当前界面中文文本最常用的那款游戏字体，避免中英混排时行距被撑高、基线错位；只调整插件字体自身的 FaceInfo，" +
-            "不改任何文本的字体或材质。关闭后使用插件字体自身度量，切换立即生效。",
-            "Only applies while \"CJK glyphs only\" is on. Aligns the plugin font's vertical metrics (line height, " +
-            "ascent/descent, baseline) proportionally to the game font the Chinese text on screen uses most, so " +
-            "mixed lines are not stretched or shifted; only the plugin font's FaceInfo changes, never a text's " +
-            "font or material. When off the plugin font keeps its own metrics. Takes effect immediately.");
+            "仅“仅替换中日韩字形”开启时有效。让插件 CJK 字形的行高和基线贴近界面主要使用的游戏字体，" +
+            "避免混排行距被撑高。只调整插件字体本身，不改文本字体或材质；切换立即生效。",
+            "Only applies while \"CJK glyphs only\" is on. Aligns the plugin font's line height and baseline " +
+            "with the game font used by most CJK text on screen, so mixed lines are not stretched. Only the " +
+            "plugin font's metrics change; text fonts and materials are untouched. Applies immediately.");
 
         private static readonly LocText NotSelectedLabel = new LocText("（未选择）", "(not selected)");
         private static readonly LocText FontsEmptyLabel = new LocText("（fonts 文件夹为空）", "(fonts folder is empty)");
@@ -490,7 +515,9 @@ namespace CuFontLoader
         {
             new LocText("FallbackOnly（仅回退）", "FallbackOnly (fallback only)"),
             new LocText("Safe（保守）", "Safe (conservative)"),
-            new LocText("Normal（常规）", "Normal (default)"),
+            new LocText("Normal（常规，推荐）", "Normal (default, recommended)"),
+            new LocText("ScaleAware（跟随原字体）", "ScaleAware (match source metrics)"),
+            new LocText("Consistent（自动重试）", "Consistent (retry when reset)"),
             new LocText("Aggressive（强制）", "Aggressive (forced)")
         };
 
@@ -569,6 +596,8 @@ namespace CuFontLoader
         private static string[] pluginFontPaths = new string[0];
         private static string[] pluginFontKeys = new string[0];
         private static string[] pluginFontLabels = new string[0];
+        private static string[] systemFontKeys = new string[0];
+        private static string[] systemFontLabels = new string[0];
         private static string[] weightKeys = new string[0];
         private static string[] weightLabels = new string[0];
         private static string[] systemFontPaths = new string[0];
@@ -642,6 +671,11 @@ namespace CuFontLoader
                 }
 
                 if (RegisterPreserveNonCjkOption())
+                {
+                    registered++;
+                }
+
+                if (RegisterCjkOverrideOption())
                 {
                     registered++;
                 }
@@ -835,7 +869,10 @@ namespace CuFontLoader
                 OnPluginFontChanged);
         }
 
-        /// <summary>Always registered, with a placeholder choice when no system font file is found.</summary>
+        /// <summary>
+        /// Always registered. The first choice is "not selected", so the selection can be cleared;
+        /// when no system font file is found the placeholder says so instead.
+        /// </summary>
         private static bool RegisterSystemFontOption()
         {
             List<string> paths = FontLoaderPlugin.ScanSystemFonts();
@@ -843,14 +880,16 @@ namespace CuFontLoader
             string[] keys;
             string[] labels;
             string[] uniquePaths;
-            BuildFontChoices(paths, NoSystemFontLabel.Value, false, out keys, out labels, out uniquePaths);
+            BuildFontChoices(paths, NoSystemFontLabel.Value, true, out keys, out labels, out uniquePaths);
             systemFontPaths = uniquePaths;
+            systemFontKeys = keys;
+            systemFontLabels = labels;
 
             return CoreLibOptions.RegisterDropdown(
                 SystemFontOption,
                 SystemFontLabel.Value,
                 SystemFontDesc.Value,
-                Math.Max(0, IndexOfFontName(FontLoaderPlugin.SystemFont.Value, systemFontPaths)),
+                Math.Max(0, SystemFontChoiceIndex(null)),
                 keys,
                 labels,
                 OnSystemFontChanged);
@@ -896,6 +935,16 @@ namespace CuFontLoader
                 OnPreserveNonCjkChanged);
         }
 
+        private static bool RegisterCjkOverrideOption()
+        {
+            return CoreLibOptions.RegisterBool(
+                CjkOverrideOption,
+                CjkOverrideLabel.Value,
+                CjkOverrideDesc.Value,
+                FontLoaderPlugin.CjkOverrideEnabled.Value,
+                OnCjkOverrideChanged);
+        }
+
         private static bool RegisterAlignNativeMetricsOption()
         {
             return CoreLibOptions.RegisterBool(
@@ -913,13 +962,30 @@ namespace CuFontLoader
                 return;
             }
 
-            if (!FontLoaderPlugin.SelectFontWeight(index))
+            string selectedPath;
+            if (!FontLoaderPlugin.SelectFontWeight(index, out selectedPath))
             {
                 FontLoaderPlugin.Log.LogWarning("Ignored font weight index " + index + " from the panel.");
                 return;
             }
 
+            FontLoaderPlugin.Log.LogInfo("[Panel] weight index " + index + " -> " +
+                (selectedPath ?? "<null>") + ".");
+
+            // Refresh the row behind the source the weight was picked from: the selected weight may be
+            // a file that was not present when the panel was first built. The visible rows are updated
+            // in place; rebuilding the whole tab here made the panel lose its font text.
+            if (FontLoaderPlugin.SystemFontPriority.Value)
+            {
+                RefreshSystemFontChoices(selectedPath);
+            }
+            else
+            {
+                RefreshVisibleFontFileDropdown();
+            }
+
             PushConfigToPanel();
+            RefreshVisibleWeightDropdown();
         }
 
         private static void OnEnabledChanged(bool value)
@@ -977,7 +1043,13 @@ namespace CuFontLoader
 
             // Index 0 is the "not selected" entry: clearing reverts the texts to the game's fonts, and
             // the tab is rebuilt so no row keeps the font it was spawned with.
-            if (index <= 0)
+            if (index < 0)
+            {
+                FontLoaderPlugin.Log.LogWarning("Ignored font file index " + index + " from the panel.");
+                return;
+            }
+
+            if (index == 0)
             {
                 FontLoaderPlugin.ClearPluginFontSelection();
                 RequestTabRefresh();
@@ -999,6 +1071,11 @@ namespace CuFontLoader
             }
 
             PushConfigToPanel();
+
+            // A refused pick leaves the visible caption on the file the user clicked; put it back on
+            // the cfg value. Cheap: the choice list is known, nothing is rescanned.
+            RefreshVisibleFontFileDropdown();
+            RefreshVisibleWeightDropdown();
         }
 
         private static void OnSystemFontChanged(int index)
@@ -1008,25 +1085,50 @@ namespace CuFontLoader
                 return;
             }
 
-            if (systemFontPaths == null || systemFontPaths.Length == 0)
-            {
-                FontLoaderPlugin.Log.LogInfo("Ignored system font selection: no system font file found.");
-                return;
-            }
-
-            if (index < 0 || index >= systemFontPaths.Length)
+            // Index 0 is the "not selected" entry: clearing removes the system font, so nothing is
+            // replaced while its priority is on.
+            if (index < 0)
             {
                 FontLoaderPlugin.Log.LogWarning("Ignored system font index " + index + " from the panel.");
                 return;
             }
 
-            if (!FontLoaderPlugin.SelectSystemFont(systemFontPaths[index]))
+            if (index == 0)
             {
-                FontLoaderPlugin.Log.LogWarning(
-                    "System font selection failed, keeping the current font: " + systemFontPaths[index]);
+                if (FontLoaderPlugin.ClearSystemFontSelection())
+                {
+                    RequestTabRefresh();
+                }
+
+                PushConfigToPanel();
+                RefreshVisibleWeightDropdown();
+                return;
             }
 
+            int fileIndex = index - 1;
+            if (systemFontPaths == null || fileIndex < 0 || fileIndex >= systemFontPaths.Length)
+            {
+                FontLoaderPlugin.Log.LogWarning("Ignored system font index " + index + " from the panel.");
+                return;
+            }
+
+            if (!FontLoaderPlugin.SelectSystemFont(systemFontPaths[fileIndex]))
+            {
+                FontLoaderPlugin.Log.LogWarning(
+                    "System font selection failed, keeping the current font: " + systemFontPaths[fileIndex]);
+                PushConfigToPanel();
+
+                // The pick was refused: put the visible caption back on the cfg value.
+                UpdateVisibleSystemFontDropdown(SystemFontChoiceIndex(null));
+                RefreshVisibleWeightDropdown();
+                return;
+            }
+
+            FontLoaderPlugin.Log.LogInfo("[Panel] system font index " + index + " -> " +
+                systemFontPaths[fileIndex] + " (priority=" + FontLoaderPlugin.SystemFontPriority.Value + ").");
+
             PushConfigToPanel();
+            RefreshVisibleWeightDropdown();
         }
 
         private static void OnPriorityChanged(bool value)
@@ -1037,8 +1139,9 @@ namespace CuFontLoader
             }
 
             FontLoaderPlugin.ApplyPanelSystemFontPriority(value);
+            RefreshSystemFontChoices();
             PushConfigToPanel();
-            RequestTabRefresh();
+            RefreshVisibleWeightDropdown();
         }
 
         private static void OnPreserveNonCjkChanged(bool value)
@@ -1049,6 +1152,17 @@ namespace CuFontLoader
             }
 
             FontLoaderPlugin.ApplyPanelPreserveNonCjk(value);
+            PushConfigToPanel();
+        }
+
+        private static void OnCjkOverrideChanged(bool value)
+        {
+            if (IgnoreWhileLoading("CjkOverrideEnabled=" + value))
+            {
+                return;
+            }
+
+            FontLoaderPlugin.ApplyPanelCjkOverride(value);
             PushConfigToPanel();
         }
 
@@ -1081,10 +1195,16 @@ namespace CuFontLoader
 
             if (FontLoaderPlugin.HasPrimaryFont())
             {
-                FontLoaderPlugin.RefreshAllTexts();
+                try
+                {
+                    FontLoaderPlugin.RefreshAllTexts();
+                }
+                catch (Exception ex)
+                {
+                    FontLoaderPlugin.Log.LogWarning("Panel re-apply failed: " + ex.Message);
+                }
             }
         }
-
         private static void RequestTabRefresh()
         {
             tabRefreshPending = true;
@@ -1134,6 +1254,30 @@ namespace CuFontLoader
         }
 
         /// <summary>
+        /// Runs a programmatic panel write without feeding it back through our own row callbacks. A
+        /// corrected index would otherwise re-run the whole select path (load, re-apply, refresh rows)
+        /// from inside itself.
+        /// </summary>
+        private static void SuppressCallbacks(Action write)
+        {
+            if (pushingToPanel)
+            {
+                write();
+                return;
+            }
+
+            pushingToPanel = true;
+            try
+            {
+                write();
+            }
+            finally
+            {
+                pushingToPanel = false;
+            }
+        }
+
+        /// <summary>
         /// Rebuilds the weight choices from values the caller already obtained (one directory scan per
         /// panel sync). Silent when nothing changed; updates the live setting otherwise.
         /// </summary>
@@ -1174,7 +1318,8 @@ namespace CuFontLoader
                 SettingDropdown dropdown = FindSetting(WeightOption) as SettingDropdown;
                 if (dropdown != null && SetDropdownChoices(dropdown, keys))
                 {
-                    dropdown.value = selectedIndex >= 0 && selectedIndex < keys.Length ? selectedIndex : 0;
+                    int value = selectedIndex >= 0 && selectedIndex < keys.Length ? selectedIndex : 0;
+                    SuppressCallbacks(delegate { dropdown.value = value; });
                 }
             }
             catch (Exception ex)
@@ -1243,6 +1388,8 @@ namespace CuFontLoader
                 CoreLibOptions.RegisterOptionText(PriorityOption, PriorityLabel.Value, PriorityDesc.Value);
                 CoreLibOptions.RegisterOptionText(PreserveNonCjkOption, PreserveNonCjkLabel.Value,
                     PreserveNonCjkDesc.Value);
+                CoreLibOptions.RegisterOptionText(CjkOverrideOption, CjkOverrideLabel.Value,
+                    CjkOverrideDesc.Value);
                 CoreLibOptions.RegisterOptionText(AlignNativeMetricsOption, AlignNativeMetricsLabel.Value,
                     AlignNativeMetricsDesc.Value);
 
@@ -1253,7 +1400,7 @@ namespace CuFontLoader
                 }
 
                 CoreLibOptions.RegisterChoiceLabel(PluginFontOption, EmptyChoiceKey, FontListEmptyText());
-                CoreLibOptions.RegisterChoiceLabel(SystemFontOption, EmptyChoiceKey, NoSystemFontLabel.Value);
+                CoreLibOptions.RegisterChoiceLabel(SystemFontOption, EmptyChoiceKey, SystemFontEmptyText());
                 CoreLibOptions.RegisterChoiceLabel(WeightOption, EmptyChoiceKey, NotSelectedLabel.Value);
             }
             catch (Exception ex)
@@ -1284,11 +1431,22 @@ namespace CuFontLoader
                 SetDropdownValue(SamplingSizeOption, IndexOfNearestSize(FontLoaderPlugin.SamplingPointSize.Value),
                     SamplingSizes.Length);
                 SetDropdownValue(PluginFontOption, PluginFontChoiceIndex(), pluginFontPaths.Length + 1);
-                SetDropdownValue(SystemFontOption, IndexOfFontName(FontLoaderPlugin.SystemFont.Value, systemFontPaths),
-                    systemFontPaths.Length);
+                int systemIndex = SystemFontChoiceIndex(null);
+                if (systemIndex < 0)
+                {
+                    // Do not rebuild dropdown rows from here. PushConfigToPanel also runs while
+                    // the tab is spawning; touching a half-built row is what made the settings
+                    // panel lose its font text. The system-font row rescans when it is opened or
+                    // when a weight/priority change explicitly refreshes it.
+                    FontLoaderPlugin.Log.LogDebug("[Panel] system font '" + FontLoaderPlugin.SystemFont.Value +
+                        "' is not in the cached list; it will be rescanned when the row is opened.");
+                }
+
+                SetDropdownValue(SystemFontOption, systemIndex, systemFontPaths.Length + 1);
                 SetDropdownValue(WeightOption, weightSelection, weightLabels.Length);
                 SetBoolValue(PriorityOption, FontLoaderPlugin.SystemFontPriority.Value);
                 SetBoolValue(PreserveNonCjkOption, FontLoaderPlugin.PreserveNonCjk.Value);
+                SetBoolValue(CjkOverrideOption, FontLoaderPlugin.CjkOverrideEnabled.Value);
                 SetBoolValue(AlignNativeMetricsOption, FontLoaderPlugin.AlignNativeMetrics.Value);
             }
             catch (Exception ex)
@@ -1307,8 +1465,8 @@ namespace CuFontLoader
         /// they are unique, readable as a fallback label, and stable across rescans. UniquePaths is the
         /// exact path list behind the file choices, so index-based lookups stay aligned.
         ///
-        /// WithEmptyChoice prepends a "not selected" entry, used by the font-file dropdown so an empty
-        /// FontFile shows as unselected instead of silently looking like the first file was picked.
+        /// WithEmptyChoice prepends a "not selected" entry; both font dropdowns use it, so an empty
+        /// selection shows as unselected instead of looking like the first file was picked.
         /// </summary>
         private const string EmptyChoiceKey = "none";
 
@@ -1397,7 +1555,8 @@ namespace CuFontLoader
                 SettingDropdown dropdown = FindSetting(PluginFontOption) as SettingDropdown;
                 if (dropdown != null && SetDropdownChoices(dropdown, keys))
                 {
-                    dropdown.value = PluginFontChoiceIndex();
+                    int value = PluginFontChoiceIndex();
+                    SuppressCallbacks(delegate { dropdown.value = value; });
                 }
 
                 FontLoaderPlugin.Log.LogDebug(
@@ -1410,6 +1569,80 @@ namespace CuFontLoader
         }
 
         /// <summary>
+        /// Rescans the system font list and rebuilds the dropdown choices. Used after a weight change
+        /// (the new weight may not be in the list captured at registration) and before the system
+        /// font dropdown is shown. Passing the selected path keeps the choice exact when two fonts
+        /// share a base name.
+        /// </summary>
+        private static void RefreshSystemFontChoices(string selectedPath = null)
+        {
+            if (!ready)
+            {
+                return;
+            }
+
+            try
+            {
+                List<string> paths = FontLoaderPlugin.ScanSystemFonts();
+                string[] keys;
+                string[] labels;
+                string[] uniquePaths;
+                BuildFontChoices(paths, NoSystemFontLabel.Value, true, out keys, out labels, out uniquePaths);
+
+                bool changed = !SameStrings(keys, systemFontKeys) || !SameStrings(labels, systemFontLabels);
+                systemFontPaths = uniquePaths;
+                systemFontKeys = keys;
+                systemFontLabels = labels;
+
+                if (changed)
+                {
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        CoreLibOptions.RegisterChoiceLabel(SystemFontOption, keys[i], labels[i]);
+                    }
+
+                    SettingDropdown data = FindSetting(SystemFontOption) as SettingDropdown;
+                    if (data != null)
+                    {
+                        SetDropdownChoices(data, keys);
+                    }
+                }
+
+                int index = SystemFontChoiceIndex(selectedPath);
+                SuppressCallbacks(delegate
+                {
+                    SetDropdownValue(SystemFontOption, index, systemFontPaths.Length + 1);
+                });
+                UpdateVisibleSystemFontDropdown(index, changed);
+                FontLoaderPlugin.Log.LogDebug("[Panel] system list refreshed: " + systemFontPaths.Length +
+                    " file(s), changed=" + changed + ", selected=" + index +
+                    " (" + (FontLoaderPlugin.SystemFont.Value ?? "<null>") + ").");
+            }
+            catch (Exception ex)
+            {
+                FontLoaderPlugin.Log.LogWarning("System font list refresh failed: " + ex.Message);
+            }
+        }
+
+        private static int IndexOfFontPath(string path, string[] paths)
+        {
+            if (string.IsNullOrEmpty(path) || paths == null)
+            {
+                return -1;
+            }
+
+            for (int i = 0; i < paths.Length; i++)
+            {
+                if (string.Equals(paths[i], path, StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        /// <summary>
         /// Called before a dropdown is shown. Only our own rows are handled: the font-file list is
         /// rescanned and the weight list is recomputed, so no scan happens on unrelated rows.
         /// </summary>
@@ -1417,6 +1650,12 @@ namespace CuFontLoader
         {
             if (!ready || dropdown == null)
             {
+                return;
+            }
+
+            if (IsRowWithLabel(dropdown.transform, SystemFontLabel))
+            {
+                RefreshSystemFontChoices();
                 return;
             }
 
@@ -1437,11 +1676,115 @@ namespace CuFontLoader
             }
         }
 
+        private static TMP_Dropdown FindDropdownWithLabel(LocText label)
+        {
+            TMP_Dropdown[] dropdowns = Resources.FindObjectsOfTypeAll<TMP_Dropdown>();
+            for (int i = 0; i < dropdowns.Length; i++)
+            {
+                TMP_Dropdown dropdown = dropdowns[i];
+                if (dropdown != null && dropdown.gameObject.activeInHierarchy &&
+                    IsRowWithLabel(dropdown.transform, label))
+                {
+                    return dropdown;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Rebuilds the visible weight row after the effective font source changed (system font,
+        /// priority, local font). The SettingDropdown data alone does not update an existing row.
+        /// </summary>
+        private static void RefreshVisibleWeightDropdown()
+        {
+            int selected;
+            string[] labels = FontLoaderPlugin.GetFontWeightChoices(out selected);
+            FontLoaderPlugin.Log.LogDebug("[Panel] weight choices: " + labels.Length +
+                ", selected=" + selected + ", system=" + FontLoaderPlugin.SystemFontPriority.Value + ".");
+            string[] beforeKeys = weightKeys;
+            string[] beforeLabels = weightLabels;
+
+            RefreshWeightChoices(labels, selected);
+            SuppressCallbacks(delegate { SetDropdownValue(WeightOption, selected, weightLabels.Length); });
+
+            bool choicesChanged = !SameStrings(weightKeys, beforeKeys) ||
+                                  !SameStrings(weightLabels, beforeLabels);
+            TMP_Dropdown dropdown = FindDropdownWithLabel(WeightLabel);
+            if (dropdown == null)
+            {
+                return;
+            }
+
+            int visibleSelection = selected >= 0 ? selected : 0;
+            if (!choicesChanged && dropdown.options.Count == weightKeys.Length)
+            {
+                dropdown.SetValueWithoutNotify(visibleSelection);
+                dropdown.RefreshShownValue();
+                return;
+            }
+
+            RebuildDropdownOptions(dropdown, weightKeys, weightLabels, visibleSelection, NotSelectedLabel.Value);
+        }
+
+        private static void RefreshVisibleFontFileDropdown()
+        {
+            TMP_Dropdown dropdown = FindDropdownWithLabel(FontFileLabel);
+            if (dropdown == null)
+            {
+                return;
+            }
+
+            int selected = PluginFontChoiceIndex();
+            if (dropdown.options.Count == pluginFontKeys.Length)
+            {
+                dropdown.SetValueWithoutNotify(selected);
+                dropdown.RefreshShownValue();
+                return;
+            }
+
+            RebuildDropdownOptions(dropdown, pluginFontKeys, pluginFontLabels, selected, FontListEmptyText());
+        }
+
+        private static void UpdateVisibleSystemFontDropdown(int selectedIndex, bool choicesChanged = false)
+        {
+            if (selectedIndex < 0)
+            {
+                return;
+            }
+
+            TMP_Dropdown dropdown = FindDropdownWithLabel(SystemFontLabel);
+            if (dropdown == null)
+            {
+                return;
+            }
+
+            // Most weight changes leave the system font list untouched. Clearing and re-adding the
+            // options just to move the selection makes the caption blank for a frame, so only
+            // rebuild the option list when the choices changed; otherwise set the value silently.
+            if (!choicesChanged && dropdown.options.Count == systemFontKeys.Length)
+            {
+                dropdown.SetValueWithoutNotify(selectedIndex);
+                dropdown.RefreshShownValue();
+                return;
+            }
+
+            RebuildDropdownOptions(dropdown, systemFontKeys, systemFontLabels, selectedIndex,
+                SystemFontEmptyText());
+        }
+
         /// <summary>Placeholder text of the font-file dropdown in the current language.</summary>
         private static string FontListEmptyText()
         {
             string none = NotSelectedLabel.Value;
             return pluginFontPaths.Length == 0 ? none + FontsEmptyLabel.Value : none;
+        }
+
+        /// <summary>Placeholder text of the system-font dropdown in the current language.</summary>
+        private static string SystemFontEmptyText()
+        {
+            string none = NotSelectedLabel.Value;
+            return systemFontPaths.Length == 0 ? none + NoSystemFontLabel.Value : none;
         }
 
         /// <summary>
@@ -1509,7 +1852,9 @@ namespace CuFontLoader
                 dropdown.ClearOptions();
                 dropdown.AddOptions(options);
 
-                dropdown.value = selectedIndex >= 0 && selectedIndex < keys.Length ? selectedIndex : 0;
+                dropdown.SetValueWithoutNotify(selectedIndex >= 0 && selectedIndex < keys.Length
+                    ? selectedIndex
+                    : 0);
                 dropdown.RefreshShownValue();
             }
             catch (Exception ex)
@@ -1553,6 +1898,28 @@ namespace CuFontLoader
 
             int index = IndexOfFontFile(FontLoaderPlugin.FontFile.Value, pluginFontPaths);
             return index < 0 ? 0 : index + 1;
+        }
+
+        /// <summary>
+        /// Dropdown index of the system font selection: 0 is "not selected", files start at 1, and -1
+        /// means the selection is not part of the cached list (the row must keep its value).
+        /// SelectedPath, when given, wins over the name in the cfg because two files can share a name.
+        /// </summary>
+        private static int SystemFontChoiceIndex(string selectedPath)
+        {
+            if (!string.IsNullOrEmpty(selectedPath))
+            {
+                int byPath = IndexOfFontPath(selectedPath, systemFontPaths);
+                return byPath < 0 ? -1 : byPath + 1;
+            }
+
+            if (string.IsNullOrEmpty(FontLoaderPlugin.SystemFont.Value))
+            {
+                return 0;
+            }
+
+            int byName = IndexOfFontName(FontLoaderPlugin.SystemFont.Value, systemFontPaths);
+            return byName < 0 ? -1 : byName + 1;
         }
 
         /// <summary>Index of the local font whose file name (with extension) matches, or -1.</summary>
