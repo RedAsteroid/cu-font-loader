@@ -16,7 +16,7 @@ using UnityEngine.TextCore.LowLevel;
 
 namespace CuFontLoader
 {
-    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.6.0")]
+    [BepInPlugin("fenchen.cu-font-loader", "CU Font Loader", "1.6.1")]
     [BepInDependency("net.cucorelib", BepInDependency.DependencyFlags.SoftDependency)]
     public class FontLoaderPlugin : BaseUnityPlugin
     {
@@ -1627,17 +1627,89 @@ namespace CuFontLoader
             }
         }
 
+        /// <summary>
+        /// Destroys a font asset together with the atlas textures and the material that
+        /// TMP_FontAsset.CreateFontAsset created for it. Destroying the asset alone leaves the
+        /// material and textures behind, both on the cache-trim path and on a failed load.
+        /// </summary>
+        private static void DestroyFontAssetObjects(TMP_FontAsset asset, Font unityFont)
+        {
+            if (asset != null)
+            {
+                try
+                {
+                    Texture2D[] textures = asset.atlasTextures;
+                    if (textures != null)
+                    {
+                        for (int i = 0; i < textures.Length; i++)
+                        {
+                            if (textures[i] != null)
+                            {
+                                Destroy(textures[i]);
+                            }
+                        }
+                    }
+
+                    Material material = asset.material;
+                    if (material != null)
+                    {
+                        Destroy(material);
+                    }
+
+                    Destroy(asset);
+                }
+                catch (Exception ex)
+                {
+                    Log.LogWarning("Destroying font asset '" + asset.name + "' failed: " + ex.Message);
+                }
+            }
+
+            if (unityFont != null)
+            {
+                Destroy(unityFont);
+            }
+        }
+
+        /// <summary>
+        /// Drops every registration of a font whose load failed, then destroys its objects.
+        /// The asset may already be in LoadedFonts when the glyph guard or the metric alignment
+        /// throws, so the cache entry has to go first.
+        /// </summary>
+        private static void ReleaseFailedFont(TMP_FontAsset asset, Font unityFont)
+        {
+            if (asset != null)
+            {
+                try
+                {
+                    RemoveFontFromFallbacks(asset);
+                    int index = LoadedFonts.IndexOf(asset);
+                    if (index >= 0)
+                    {
+                        RemoveCachedFontEntry(index);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.LogWarning("Cleaning up failed font '" + asset.name + "' failed: " + ex.Message);
+                }
+            }
+
+            DestroyFontAssetObjects(asset, unityFont);
+        }
+
         private static TMP_FontAsset LoadFont(string fontPath)
         {
+            Font dynamicFont = null;
+            TMP_FontAsset fontAsset = null;
             try
             {
                 float startedAt = Time.realtimeSinceStartup;
                 Log.LogInfo("Loading: " + Path.GetFileName(fontPath));
-                Font dynamicFont = new Font(fontPath);
+                dynamicFont = new Font(fontPath);
                 int atlasSize = Mathf.Clamp(AtlasSize.Value, 512, 8192);
                 int samplingPointSize = CurrentSamplingSize();
                 int atlasPadding = Mathf.Clamp(AtlasPadding.Value, 1, 16);
-                TMP_FontAsset fontAsset = TMP_FontAsset.CreateFontAsset(
+                fontAsset = TMP_FontAsset.CreateFontAsset(
                     dynamicFont,
                     samplingPointSize,
                     atlasPadding,
@@ -1650,6 +1722,7 @@ namespace CuFontLoader
                 if (fontAsset == null)
                 {
                     Log.LogWarning("  FAIL: no font asset was created for " + Path.GetFileName(fontPath));
+                    DestroyFontAssetObjects(null, dynamicFont);
                     return null;
                 }
 
@@ -1695,6 +1768,7 @@ namespace CuFontLoader
             catch (System.Exception ex)
             {
                 Log.LogError("  FAIL: " + ex.Message);
+                ReleaseFailedFont(fontAsset, dynamicFont);
                 return null;
             }
         }
@@ -4263,6 +4337,7 @@ namespace CuFontLoader
                 return null;
             }
 
+            TMP_FontAsset profile = null;
             try
             {
                 int sampling = PrimaryFontAsset.faceInfo.pointSize > 0
@@ -4271,7 +4346,7 @@ namespace CuFontLoader
                 int atlasSize = Mathf.Clamp(AtlasSize.Value, 512, 8192);
                 int padding = Mathf.Clamp(AtlasPadding.Value, 1, 16);
 
-                TMP_FontAsset profile = TMP_FontAsset.CreateFontAsset(
+                profile = TMP_FontAsset.CreateFontAsset(
                     sourceFont,
                     sampling,
                     padding,
@@ -4334,6 +4409,25 @@ namespace CuFontLoader
             catch (Exception ex)
             {
                 Log.LogWarning("[Metrics] profile for '" + source.name + "' failed: " + ex.Message);
+                if (profile != null)
+                {
+                    try
+                    {
+                        KnownFonts.Remove(profile);
+                        ProfileAssets.Remove(profile);
+                        NativeMetricsAligned.Remove(profile);
+                        OriginalFaceInfo.Remove(profile);
+                        RemoveFontFromFallbacks(profile);
+                    }
+                    catch (Exception cleanup)
+                    {
+                        Log.LogWarning("[Metrics] profile cleanup for '" + source.name +
+                            "' failed: " + cleanup.Message);
+                    }
+
+                    DestroyFontAssetObjects(profile, null);
+                }
+
                 return null;
             }
         }
@@ -6764,29 +6858,14 @@ namespace CuFontLoader
             string name = asset.name;
             int samplingSize = index < LoadedFontSizes.Count ? LoadedFontSizes[index] : 0;
 
-            // Drop every fallback reference first, then the textures, the asset and its source font.
+            // Drop every fallback reference first, then the textures, the material, the asset and
+            // its source font.
             RemoveFontFromFallbacks(asset);
             RemoveCachedFontEntry(index);
 
             try
             {
-                Texture2D[] atlasTextures = asset.atlasTextures;
-                if (atlasTextures != null)
-                {
-                    for (int i = 0; i < atlasTextures.Length; i++)
-                    {
-                        if (atlasTextures[i] != null)
-                        {
-                            Destroy(atlasTextures[i]);
-                        }
-                    }
-                }
-
-                Destroy(asset);
-                if (unityFont != null)
-                {
-                    Destroy(unityFont);
-                }
+                DestroyFontAssetObjects(asset, unityFont);
 
                 Log.LogInfo("Released cached font asset '" + name + "' (sampling " + samplingSize + ").");
                 return true;

@@ -606,10 +606,9 @@ namespace CuFontLoader
     /// <summary>
     /// Character classification for "CJK is ours, everything else stays native": Chinese and Japanese
     /// ideographs, Japanese kana, Korean Hangul, and the punctuation and fullwidth forms that belong to
-    /// those scripts. Shared punctuation such as curly quotes, dashes and ellipsis is a separate
-    /// exception handled by IsCjkPunctuation: the guard may keep it in a plugin font, and a legacy
-    /// pure-CJK label may contain it only when it also contains a real CJK character. Other general
-    /// punctuation, symbols and emoji stay on the game font.
+    /// those scripts. Shared punctuation (curly quotes, ellipsis, middle dot, dashes, reference mark)
+    /// is no longer treated as CJK: it stays on the game font, and a legacy pure-CJK label may not
+    /// contain it. Other general punctuation, symbols and emoji stay on the game font.
     /// </summary>
     internal static class CjkText
     {
@@ -636,17 +635,16 @@ namespace CuFontLoader
         }
 
         /// <summary>
-        /// Punctuation shared by CJK and Latin typography. It is deliberately not part of IsCjk:
-        /// classifying it globally would make English paragraphs count as CJK. The guard may keep
-        /// these glyphs in a plugin font, and a legacy pure-CJK label may contain them only when it
-        /// also contains a real CJK character.
+        /// Disabled: shared punctuation (middle dot, curly quotes, ellipsis, dashes, reference mark) is
+        /// no longer treated as CJK. Kept as a no-op so the call sites stay in one place and the list
+        /// below can be restored if the old behaviour is wanted again.
         /// </summary>
         internal static bool IsCjkPunctuation(uint codePoint)
         {
+            return false;
+
+            /*
             return codePoint == 0x00B7 ||   // middle dot
-                   codePoint == 0x2013 ||   // en dash
-                   codePoint == 0x2014 ||   // em dash
-                   codePoint == 0x2015 ||   // horizontal bar
                    codePoint == 0x2018 ||   // left single quotation mark
                    codePoint == 0x2019 ||   // right single quotation mark
                    codePoint == 0x201C ||   // left double quotation mark
@@ -655,11 +653,13 @@ namespace CuFontLoader
                    codePoint == 0x2026 ||   // ellipsis
                    codePoint == 0x2027 ||   // hyphenation point
                    codePoint == 0x203B;     // reference mark
+            */
         }
 
         internal static bool IsCjkGlyph(uint codePoint)
         {
-            return IsCjk(codePoint) || IsCjkPunctuation(codePoint);
+            // Shared punctuation is disabled; only characters inside the CJK ranges count.
+            return IsCjk(codePoint);
         }
 
         /// <summary>
@@ -688,12 +688,16 @@ namespace CuFontLoader
                     continue;
                 }
 
+                // Shared punctuation is disabled, so a label containing quotes, ellipsis or a dash is
+                // no longer eligible for whole-string replacement on legacy UI.Text.
+                /*
                 if (IsCjkPunctuation(character))
                 {
                     // Shared punctuation is allowed around a CJK label, but does not make a
                     // punctuation-only string count as CJK.
                     continue;
                 }
+                */
 
                 if (char.IsHighSurrogate(character) && i + 1 < text.Length &&
                     char.IsLowSurrogate(text[i + 1]))

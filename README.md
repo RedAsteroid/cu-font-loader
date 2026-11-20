@@ -13,6 +13,10 @@
 - **No game asset modification**：不修改游戏资源文件与 AssetBundle，卸载即恢复
 - **Graceful degradation**：CUCoreLib 缺失时面板不注册，功能全部由配置文件驱动
 
+> **v1.6.1** — 停用共享标点名单（`IsCjkPunctuation`）：弯引号、省略号、间隔号、破折号等中英共用标点不再按 CJK 字形处理，「仅替换中日韩字形」下改由游戏原字体绘制。
+>
+> 修复：缓存释放时没有销毁 `TMP_FontAsset` 的材质；字体加载或 profile 创建失败时会残留已创建的图集、材质和字体资产。两种情况现在都会完整释放。
+>
 > **v1.6.0** — 新增韩文（谚文）支持：`PreserveNonCjk` 的 CJK 判定加入谚文，韩文与中日文走同一条 fallback；面板项改名为「仅替换中日韩字形」「中日韩字体替换白名单」；「系统字体」新增「（未选择）」。
 >
 > 修复：解除白名单接管或切到“无字体”状态时，文本可能保留已释放的 profile 图集或材质，导致文字（包括控制台）空白——还原时会一并还原材料，无字体时清掉全部 fallback 链并强制重排。面板改动改为下一帧生效；切换字体或采样字号时释放旧 profile；新增空字形诊断日志，便于定位字体里“有码位、无轮廓”的字符。
@@ -24,7 +28,7 @@
 | 上游项目 | [FenChen0211/cu-font-loader](https://github.com/FenChen0211/cu-font-loader) |
 | 本仓库（fork） | [RedAsteroid/cu-font-loader](https://github.com/RedAsteroid/cu-font-loader) |
 | 本分支 | `update`（基于上游 `feat/v1.4.0-pre.1-compatibility`） |
-| 本分支版本 | v1.6.0 |
+| 本分支版本 | v1.6.1 |
 | 许可证 | MIT，上游版权归 FenChen0211；详见 [LICENSE](./LICENSE) |
 
 本分支基于上游 `feat/v1.4.0-pre.1-compatibility` 分支继续开发（并非从 `main` 直接拉出），与上游 `main` 的行为不完全一致。反馈请提交到 [Issues](https://github.com/RedAsteroid/cu-font-loader/issues)，附 BepInEx 日志更佳。
@@ -153,7 +157,9 @@ AlignNativeMetrics = true
   ```
 
 - 销毁前会确认没有文本、输入框、fallback 表或快照还引用该资产；当前字体与当前字号不会被释放
+- **单字号文件不会被释放**：上限是按文件计算的，一个文件只缓存过一个字号时不会淘汰它。切换过多个字体时，每个字体都会留下至少一张图集，显存随选过的字体数量累加
 - `MaxFontProfiles`：每个源字体一份度量 profile，默认最多同时保留 `4` 份（`0` = 不限），最近使用的优先；被引用的 profile 不会释放，达到上限时新的源字体退回主字体。每份 profile 同样使用 `AtlasSize²` 图集，`4096²` 时约 16.7 MB
+- 白名单字体（`CjkOverrideFonts`）走强制分支，不受 `MaxFontProfiles` 限制；每个白名单字体各占一份 profile，名单越长占用越高
 - 切换字体或采样字号后，旧 primary 建出的 profile 会被释放，不会随着反复切换累积占用
 - 每个资产图集为 `AtlasSize²`（Alpha8，`4096² ≈ 16.7 MB`），CJK 字形多时还会追加图集页
 - `AtlasSize` 建议 `4096`；显存紧张可降为 `2048`，代价是更容易出现缺字
@@ -195,7 +201,7 @@ PreserveNonCjk = true
 - 性能：新文本由 `OnEnable` 钩子处理，字体和文本变更由 `TMP_Text.font` / `TMP_Text.text` setter 钩子处理；正常情况下不再按 `ScanIntervalSeconds` 全量扫描。钩子不可用时改用每帧最多 24 个文本、1.5 ms 的分帧增量扫描。混排文本会多出一个由 fallback 材质绘制的 sub-mesh，同一画布按材质合批，通常只增加少量 draw call
 - **行距对齐**（`[Font] AlignNativeMetrics`，默认开启，面板可切换）：混排行高取行内字符所属字体的 ascender/descender 最大值，插件会把自己的垂直度量按比例对齐到**当前界面里 CJK 文本最常用的那款游戏字体**（每轮扫描统计），并在参考字体变化时重新对齐；面板切换立即生效
 - 退出该模式（关闭开关、切到 `FallbackOnly`、禁用插件、取消字体选择）时，会把插件字体从所有被扩展的 fallback 链中移除，并还原曾被替换的文本
-- 开启时仍会剔除插件字体里已有的非 CJK 字形，CJK 字形按需加入图集；CJK 常用的弯引号 `“”‘’`、破折号、省略号、间隔号等共享标点按 CJK 处理，其他通用标点仍保持原生
+- 开启时仍会剔除插件字体里已有的非 CJK 字形，CJK 字形按需加入图集；弯引号、省略号、间隔号、破折号等中英共用标点按非 CJK 处理，始终由游戏原字体绘制
 - **韩文与中日文走同一条路径**：所选字体带谚文字形时由插件字体补字，字体缺该码位时继续沿 fallback 链降级到游戏原字体；如果字体把码位映射成**空轮廓**，TMP 会认为找到了并画出空白、不会降级——开启 `LogTextDetails` 或 `CompatibilityLog` 后会输出 `[Native] '…' maps U+XXXX to an empty glyph`，便于据此排查翻译文本
 - 不修改预制体（prefab）里的文本：只处理屏幕上真实存在的对象，避免把插件字体写进预制体后，新生成的界面元素一出生就带着插件字体
 - 少数界面元素是从"替换期间被改过的模板"克隆出来的，没有自己的原字体快照；插件会把它换成一款游戏原生字体（优先选当前界面 CJK 文本最常用的那款），而不是让它继续用插件字体
